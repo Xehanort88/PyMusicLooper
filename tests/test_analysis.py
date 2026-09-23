@@ -1,13 +1,16 @@
 import numpy as np
 import pytest
-from conftest import INTRO_SAMPLES, SAMPLE_TOLERANCE, SR, assert_whole_patterns
+from conftest import INTRO_SAMPLES, PATTERN_SAMPLES, SAMPLE_TOLERANCE, SR, assert_whole_patterns
 
 from pymusiclooper import analysis
 from pymusiclooper.analysis import (
     LoopPair,
+    _align_loop_end,
+    _best_seam,
     _calculate_loop_score,
     _calculate_subseq_beat_similarity,
     _prioritize_duration,
+    _refine_loop_points,
     _weights,
     nearest_zero_crossing,
 )
@@ -138,6 +141,60 @@ def test_truncated_lookbehind_weights_frames_nearest_the_loop_point():
     score = _calculate_subseq_beat_similarity(3, 100, chroma, -20, weights=weights)
 
     assert score == pytest.approx(weights[-3:].sum() / weights.sum())
+
+
+# --- Sample-level alignment ---
+
+
+def test_best_loops_are_sample_exact(looper, pairs):
+    audio = looper.mlaudio.playback_audio
+    for pair in pairs[:5]:
+        assert (pair.loop_end - pair.loop_start) % PATTERN_SAMPLES == 0
+        # The audio heard after jumping back is identical to what would have played
+        np.testing.assert_array_equal(
+            audio[pair.loop_start:pair.loop_start + 1000], audio[pair.loop_end:pair.loop_end + 1000]
+        )
+
+
+def _noise(seconds=3.0, seed=1):
+    return np.random.default_rng(seed).standard_normal(int(seconds * SR)).astype(np.float32)
+
+
+@pytest.mark.parametrize("offset", [-1000, -1, 0, 1, 700, analysis._ALIGNMENT_SEARCH_RADIUS])
+def test_align_loop_end_finds_matching_waveform(offset):
+    mono = _noise()
+    loop_start, true_loop_end = 10000, 50000
+    mono[true_loop_end - 3000:true_loop_end + 3000] = mono[loop_start - 3000:loop_start + 3000]
+
+    aligned, correlation = _align_loop_end(mono, SR, loop_start, true_loop_end + offset)
+
+    assert aligned == true_loop_end
+    assert correlation == pytest.approx(1.0)
+
+
+def test_align_loop_end_reports_low_correlation_for_unrelated_audio():
+    _, correlation = _align_loop_end(_noise(), SR, 10000, 50000)
+    assert correlation < analysis._MIN_ALIGNMENT_CORRELATION
+
+
+def test_align_loop_end_keeps_loop_end_after_loop_start():
+    mono = _noise()
+    aligned, _ = _align_loop_end(mono, SR, 10000, 10050)
+    assert aligned > 10000
+
+
+def test_best_seam_picks_where_waveforms_match():
+    audio = _noise()[:, np.newaxis].repeat(2, axis=1)
+    loop_start, loop_end, match_at = 10000, 50000, 37
+    audio[loop_end + match_at - 2:loop_end + match_at + 2] = audio[loop_start + match_at - 2:loop_start + match_at + 2]
+
+    assert _best_seam(audio, SR, loop_start, loop_end) == (loop_start + match_at, loop_end + match_at)
+
+
+def test_refine_loop_points_falls_back_to_zero_crossings_for_unrelated_audio():
+    audio = _noise()[:, np.newaxis]
+    refined = _refine_loop_points(audio, audio[:, 0], SR, 10000, 50000)
+    assert refined == (nearest_zero_crossing(audio, SR, 10000), nearest_zero_crossing(audio, SR, 50000))
 
 
 # --- Zero crossings ---

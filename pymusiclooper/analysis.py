@@ -5,6 +5,7 @@ from typing import List, Optional, Tuple
 
 import librosa
 import numpy as np
+import scipy.signal
 from numba import njit
 
 from pymusiclooper.audio import MLAudio
@@ -174,9 +175,11 @@ def find_best_loop_points(
         mlaudio, chroma, bpm, candidate_pairs, disable_pruning
     )
 
-    # Set the exact loop start and end in samples and adjust them
-    # to the nearest zero crossing. Avoids audio popping/clicking while looping
-    # as much as possible.
+    # Set the exact loop start and end in samples. The frame-level points are refined by lining up
+    # the waveforms at the loop points, then choosing the seam where they differ the least;
+    # if the waveforms do not match well enough for that, each point is moved to its nearest zero crossing.
+    # Avoids audio popping/clicking while looping as much as possible.
+    mono_playback_audio = mlaudio.playback_audio.mean(axis=1)
     for pair in filtered_candidate_pairs:
         if mlaudio.trim_offset > 0:
             pair._loop_start_frame_idx = int(
@@ -185,15 +188,12 @@ def find_best_loop_points(
             pair._loop_end_frame_idx = int(
                 mlaudio.apply_trim_offset(pair._loop_end_frame_idx)
             )
-        pair.loop_start = nearest_zero_crossing(
+        pair.loop_start, pair.loop_end = _refine_loop_points(
             mlaudio.playback_audio,
+            mono_playback_audio,
             mlaudio.rate,
-            mlaudio.frames_to_samples(pair._loop_start_frame_idx)
-        )
-        pair.loop_end = nearest_zero_crossing(
-            mlaudio.playback_audio,
-            mlaudio.rate,
-            mlaudio.frames_to_samples(pair._loop_end_frame_idx)
+            int(mlaudio.frames_to_samples(pair._loop_start_frame_idx)),
+            int(mlaudio.frames_to_samples(pair._loop_end_frame_idx)),
         )
 
     if not filtered_candidate_pairs:
@@ -539,6 +539,113 @@ def _calculate_subseq_beat_similarity(
 
 def _weights(length: int, start: int = 100, stop: int = 1):
     return np.geomspace(start, stop, num=length)
+
+
+# STFT hop length used by the analysis (librosa's default); frame-level loop points are only this precise
+_HOP_LENGTH = 512
+# How far (in samples) the loop end may be moved to line up the waveforms
+_ALIGNMENT_SEARCH_RADIUS = 2 * _HOP_LENGTH
+# Length of the audio compared on each side of the loop points when aligning them (in seconds)
+_ALIGNMENT_HALF_WINDOW = 0.075
+# Below this correlation, the audio around the loop points does not match well enough
+# for lining up the waveforms to be reliable (found by comparing both methods on real tracks)
+_MIN_ALIGNMENT_CORRELATION = 0.3
+
+
+def _refine_loop_points(
+    audio: np.ndarray, mono_audio: np.ndarray, rate: int, loop_start: int, loop_end: int
+) -> Tuple[int, int]:
+    """Refines frame-level loop points to exact sample positions.
+
+    Lines up the waveforms at the loop points, then picks the seam where they differ the least.
+    If the waveforms do not match well enough, each point is moved to its nearest zero crossing instead.
+
+    Args:
+        audio (np.ndarray): Playback audio, in the shape `(samples, n_channels)`
+        mono_audio (np.ndarray): The playback audio mixed down to mono, in the shape `(samples,)`
+        rate (int): Sample rate of the audio
+        loop_start (int): Approximate loop start in samples
+        loop_end (int): Approximate loop end in samples
+
+    Returns:
+        Tuple[int, int]: The refined (loop_start, loop_end)
+    """
+    aligned_loop_end, correlation = _align_loop_end(mono_audio, rate, loop_start, loop_end)
+    if correlation >= _MIN_ALIGNMENT_CORRELATION:
+        return _best_seam(audio, rate, loop_start, aligned_loop_end)
+    return (
+        nearest_zero_crossing(audio, rate, loop_start),
+        nearest_zero_crossing(audio, rate, loop_end),
+    )
+
+
+def _align_loop_end(mono_audio: np.ndarray, rate: int, loop_start: int, loop_end: int) -> Tuple[int, float]:
+    """Moves the loop end (within `_ALIGNMENT_SEARCH_RADIUS` samples) to where the waveform around it best matches
+    the waveform around the loop start, using normalized cross-correlation.
+
+    Args:
+        mono_audio (np.ndarray): Mono playback audio, in the shape `(samples,)`
+        rate (int): Sample rate of the audio
+        loop_start (int): Loop start in samples
+        loop_end (int): Approximate loop end in samples
+
+    Returns:
+        Tuple[int, float]: The aligned loop end, and the correlation of the waveforms at that point (-1 to 1).
+        The correlation is 0 if there was not enough audio around the loop points to compare.
+    """
+    # The loop end must stay after the loop start
+    radius = min(_ALIGNMENT_SEARCH_RADIUS, loop_end - loop_start - 1)
+    half_window = int(_ALIGNMENT_HALF_WINDOW * rate)
+    n_samples = mono_audio.shape[0]
+
+    # Compare as much audio as available on each side, up to half_window
+    before = min(half_window, loop_start, loop_end - radius)
+    after = min(half_window, n_samples - loop_start, n_samples - loop_end - radius)
+    if radius < 0 or before + after < _HOP_LENGTH:
+        return loop_end, 0.0
+
+    reference = mono_audio[loop_start - before:loop_start + after].astype(np.float64)
+    search = mono_audio[loop_end - before - radius:loop_end + after + radius].astype(np.float64)
+
+    # correlation[i] compares the reference with the search window shifted by (i - radius) samples
+    correlation = scipy.signal.correlate(search, reference, mode="valid", method="fft")
+    cumulative_energy = np.concatenate(([0.0], np.cumsum(search**2)))
+    window_energy = cumulative_energy[reference.size:] - cumulative_energy[:-reference.size]
+    normalized = correlation / np.sqrt(np.maximum(window_energy * np.dot(reference, reference), 1e-20))
+
+    best = int(np.argmax(normalized))
+    return loop_end + best - radius, float(normalized[best])
+
+
+def _best_seam(audio: np.ndarray, rate: int, loop_start: int, loop_end: int) -> Tuple[int, int]:
+    """Shifts both loop points by the same amount (keeping the loop length) to where the waveforms at the
+    loop start and loop end differ the least, within +/-5ms. The difference at the jump is what causes clicks.
+
+    Args:
+        audio (np.ndarray): Playback audio, in the shape `(samples, n_channels)`
+        rate (int): Sample rate of the audio
+        loop_start (int): Loop start in samples
+        loop_end (int): Loop end in samples
+
+    Returns:
+        Tuple[int, int]: The shifted (loop_start, loop_end)
+    """
+    radius = max(1, rate // 200)
+    # Compare the two samples before and after each point
+    offsets = np.arange(-2, 2)
+    lowest_shift = max(-radius, -(loop_start + offsets[0]))
+    highest_shift = min(radius, audio.shape[0] - 1 - (loop_end + offsets[-1]))
+    if lowest_shift > highest_shift:
+        return loop_start, loop_end
+
+    shifts = np.arange(lowest_shift, highest_shift + 1)
+    idx = shifts[:, np.newaxis] + offsets[np.newaxis, :]
+    difference = np.abs(audio[loop_start + idx] - audio[loop_end + idx]).sum(axis=(1, 2))
+    # Prefer the smallest shift among equally good ones
+    difference += 1e-6 * np.abs(shifts)
+
+    shift = int(shifts[np.argmin(difference)])
+    return loop_start + shift, loop_end + shift
 
 
 @njit(cache=True)
