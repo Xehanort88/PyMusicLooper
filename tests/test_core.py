@@ -253,6 +253,51 @@ def test_trim_rejects_unsupported_formats(track, tmp_path, filename, format, sub
         MusicLooper(str(source_path)).trim(LOOP_END, output_dir=str(tmp_path))
 
 
+@pytest.mark.parametrize(
+    ("filename", "format", "subtype", "supported"),
+    [
+        ("pcm16.wav", "WAV", "PCM_16", True),
+        ("float.wav", "WAV", "FLOAT", True),
+        ("track.flac", "FLAC", "PCM_16", True),
+        ("track.ogg", "OGG", "VORBIS", True),
+        ("track.opus", "OGG", "OPUS", False),
+        ("track.mp3", "MP3", "MPEG_LAYER_III", False),
+        ("ulaw.wav", "WAV", "ULAW", False),
+    ],
+)
+def test_supports_lossless_trim(track, tmp_path, filename, format, subtype, supported):
+    source_path = tmp_path / filename
+    sf.write(source_path, track, SR if subtype != "OPUS" else 48000, format=format, subtype=subtype)
+
+    assert MusicLooper(str(source_path)).supports_lossless_trim() is supported
+
+
+@pytest.mark.parametrize("filename", ["track.flac", "track.ogg"])
+def test_export_tags_with_trim_writes_single_tagged_trimmed_file(track, tmp_path, filename):
+    source_path = tmp_path / filename
+    sf.write(source_path, track, SR)
+    out_dir = tmp_path / "out"
+    out_dir.mkdir()
+
+    MusicLooper(str(source_path)).export_tags(
+        LOOP_START, LOOP_END, "LOOPSTART", "LOOPLENGTH", output_dir=str(out_dir), trim=True, keep_after=100
+    )
+
+    track_name, extension = os.path.splitext(filename)
+    assert os.listdir(out_dir) == [f"{track_name}-tagged{extension}"]
+    output_path = str(out_dir / f"{track_name}-tagged{extension}")
+    assert sf.info(output_path).frames == LOOP_END + 100
+    assert MusicLooper(output_path).read_tags("LOOPSTART", "LOOPLENGTH") == (LOOP_START, LOOP_END)
+
+
+def test_export_tags_with_trim_rejects_unsupported_formats(track, tmp_path):
+    source_path = tmp_path / "track.mp3"
+    sf.write(source_path, track, SR, format="MP3")
+
+    with pytest.raises(ValueError):
+        MusicLooper(str(source_path)).export_tags(LOOP_START, LOOP_END, "LOOP_START", "LOOP_END", output_dir=str(tmp_path), trim=True)
+
+
 def test_ogg_vorbis_packet_durations_match_granule_positions(track, tmp_path):
     from pymusiclooper.ogg import _find_packet_cut, _read_pages
 

@@ -151,6 +151,10 @@ pymusiclooper -i tag --path "TRACK_NAME.mp3" --tag-names LOOP_START LOOP_END
 # The original format, bit depth and tags are preserved; OGG files are cut without re-encoding
 pymusiclooper -i trim --path "TRACK_NAME.wav" --keep-after 1000
 
+# In interactive mode, the other export subcommands also offer to trim WAV, FLAC and OGG Vorbis files
+# after the loop is chosen; with `tag`, a single tagged and trimmed copy is written
+pymusiclooper -i tag --path "TRACK_NAME.ogg" --tag-names LOOPSTART LOOPLENGTH
+
 
 # Export the loop points (in samples) of all tracks in a particular directory to a loops.txt file
 # (compatible with https://github.com/libertyernie/LoopingAudioConverter/)

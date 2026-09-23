@@ -14,6 +14,10 @@ from pymusiclooper.core import MusicLooper
 from pymusiclooper.exceptions import AudioLoadError, LoopNotFoundError
 from pymusiclooper.utils import DEFAULT_OUTPUT_DIRECTORY_NAME
 
+# Default number of samples to keep after the loop end when trimming interactively: enough for players
+# that read slightly past the loop end (e.g. for resampling), while being inaudible (~2 ms at 44.1 kHz)
+RECOMMENDED_KEEP_AFTER = 100
+
 
 class LoopHandler:
     def __init__(
@@ -177,13 +181,8 @@ class LoopHandler:
                 return get_user_input()
 
             return selected_index
-        # On Windows, Ctrl+C at the prompt can surface as an EOFError, with the
-        # actual interrupt delivered moments later
         except (KeyboardInterrupt, EOFError):
-            rich_console.print("\n[red]Operation terminated by user. Exiting.[/]")
-            # Ignore further Ctrl+C so that a late interrupt does not break the audio cleanup at exit
-            signal.signal(signal.SIGINT, signal.SIG_IGN)
-            sys.exit()
+            _exit_by_user()
 
 
 class LoopExportHandler(LoopHandler):
@@ -249,6 +248,10 @@ class LoopExportHandler(LoopHandler):
         loop_start = chosen_loop_pair.loop_start
         loop_end = chosen_loop_pair.loop_end
 
+        if self.interactive_mode and not self.trim and self.musiclooper.supports_lossless_trim():
+            with _hideprogressbar(self._progressbar):
+                self.trim, self.keep_after = self.trim_prompt()
+
         # Runners that do not need an output directory
         if self.to_stdout:
             self.stdout_export_runner(loop_start, loop_end)
@@ -278,7 +281,8 @@ class LoopExportHandler(LoopHandler):
             if self.extended_length:
                 self.extend_track_runner(loop_start, loop_end)
 
-            if self.trim:
+            # The tag runner trims its tagged copy itself, so that a single file is written
+            if self.trim and self.tag_names is None:
                 self.trim_runner(loop_end)
         finally:
             if (
@@ -337,6 +341,28 @@ class LoopExportHandler(LoopHandler):
         # Usually: unknown file format specified; raised by soundfile
         except ValueError as e:
             logging.error(e)
+
+    def trim_prompt(self) -> Tuple[bool, int]:
+        """Asks whether to also losslessly trim the audio after the chosen loop end, and how many samples to keep after it."""
+        try:
+            answer = rich_console.input("Trim the audio after the loop end? [cyan]\\[y/N][/]: ")
+            if answer.strip().lower() not in ("y", "yes"):
+                return False, 0
+
+            while True:
+                keep_after = rich_console.input(
+                    f"Samples to keep after the loop end (press Enter for the recommended [cyan]{RECOMMENDED_KEEP_AFTER}[/]): "
+                ).strip()
+                if not keep_after:
+                    return True, RECOMMENDED_KEEP_AFTER
+                try:
+                    if int(keep_after) >= 0:
+                        return True, int(keep_after)
+                except ValueError:
+                    pass
+                rich_console.print(f"Please enter a whole number of samples (0 or more), or press Enter for {RECOMMENDED_KEEP_AFTER}.")
+        except (KeyboardInterrupt, EOFError):
+            _exit_by_user()
 
     def trim_runner(self, loop_end: int):
         try:
@@ -409,8 +435,16 @@ class LoopExportHandler(LoopHandler):
             loop_end_tag,
             is_offset=self.tag_offset,
             output_dir=self.output_directory,
+            trim=self.trim,
+            keep_after=self.keep_after,
         )
-        message = f"Exported {loop_start_tag}: {loop_start} and {loop_end_tag}: {loop_end} of \"{self.musiclooper.filename}\" to a copy in \"{self.output_directory}\""
+        if not self.trim:
+            copy_description = "a copy"
+        elif self.keep_after:
+            copy_description = f"a copy trimmed {self.keep_after} samples after the loop end"
+        else:
+            copy_description = "a copy trimmed at the loop end"
+        message = f"Exported {loop_start_tag}: {loop_start} and {loop_end_tag}: {loop_end} of \"{self.musiclooper.filename}\" to {copy_description} in \"{self.output_directory}\""
         if self.batch_mode:
             logging.info(message)
         else:
@@ -544,6 +578,18 @@ class BatchHandler:
                 and len(os.listdir(directory)) == 0
             ):
                 os.removedirs(directory)
+
+
+def _exit_by_user():
+    """Exits after the user interrupted a prompt.
+
+    Catch both KeyboardInterrupt and EOFError around prompts: on Windows, Ctrl+C at a prompt
+    can surface as an EOFError, with the actual interrupt delivered moments later.
+    """
+    rich_console.print("\n[red]Operation terminated by user. Exiting.[/]")
+    # Ignore further Ctrl+C so that a late interrupt does not break the audio cleanup at exit
+    signal.signal(signal.SIGINT, signal.SIG_IGN)
+    sys.exit()
 
 
 @contextmanager
