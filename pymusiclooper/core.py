@@ -1,6 +1,7 @@
 """Contains the core MusicLooper class that can be
 used for programmatic access to the CLI's main features."""
 
+import logging
 import os
 import shutil
 from math import ceil
@@ -11,6 +12,8 @@ import numpy as np
 
 from pymusiclooper.analysis import LoopPair, find_best_loop_points
 from pymusiclooper.audio import MLAudio
+from pymusiclooper.exceptions import LoopNotFoundError
+from pymusiclooper.ogg import trim_vorbis
 from pymusiclooper.playback import PlaybackHandler
 
 # Lazy-load external libraries when they're needed
@@ -35,8 +38,10 @@ class MusicLooper:
         approx_loop_end: Optional[float] = None,
         brute_force: bool = False,
         disable_pruning: bool = False,
+        use_embedded_tags: bool = True,
     ) -> List[LoopPair]:
         """Finds the best loop points for the track, according to the parameters specified.
+        If the file already has loop points stored in its metadata tags, they are returned as the first choice.
 
         Args:
             min_duration_multiplier (float, optional): The minimum duration of a loop as a multiplier of track duration. Defaults to 0.35.
@@ -46,22 +51,70 @@ class MusicLooper:
             approx_loop_end (float, optional): The approximate location of the desired loop end (in seconds). If specified, must specify approx_loop_start as well. Defaults to None.
             brute_force (bool, optional): Checks the entire track instead of the detected beats (disclaimer: runtime may be significantly longer). Defaults to False.
             disable_pruning (bool, optional): Returns all the candidate loop points without filtering. Defaults to False.
-        
+            use_embedded_tags (bool, optional): Places the loop points found in the file's metadata tags (if any) first in the returned list. Ignored if an approximate loop position is specified. Defaults to True.
+
         Raises:
             LoopNotFoundError: raised in case no loops were found
 
         Returns:
             List[LoopPair]: A list of `LoopPair` objects containing the loop points related data. See the `LoopPair` class for more info.
         """
-        return find_best_loop_points(
-            mlaudio=self.mlaudio,
-            min_duration_multiplier=min_duration_multiplier,
-            min_loop_duration=min_loop_duration,
-            max_loop_duration=max_loop_duration,
-            approx_loop_start=approx_loop_start,
-            approx_loop_end=approx_loop_end,
-            brute_force=brute_force,
-            disable_pruning=disable_pruning
+        embedded_pair = None
+        if use_embedded_tags and approx_loop_start is None and approx_loop_end is None:
+            embedded_pair = self.read_embedded_loop_pair()
+
+        try:
+            loop_pairs = find_best_loop_points(
+                mlaudio=self.mlaudio,
+                min_duration_multiplier=min_duration_multiplier,
+                min_loop_duration=min_loop_duration,
+                max_loop_duration=max_loop_duration,
+                approx_loop_start=approx_loop_start,
+                approx_loop_end=approx_loop_end,
+                brute_force=brute_force,
+                disable_pruning=disable_pruning
+            )
+        except LoopNotFoundError:
+            if embedded_pair is None:
+                raise
+            loop_pairs = []
+
+        if embedded_pair is not None:
+            loop_pairs.insert(0, embedded_pair)
+
+        return loop_pairs
+
+    def read_embedded_loop_pair(self) -> Optional[LoopPair]:
+        """Reads the loop points stored in the file's metadata tags (e.g. LOOP_START/LOOP_END), auto-detecting the tag names.
+
+        Returns:
+            Optional[LoopPair]: A `LoopPair` with `from_metadata=True`, or None if the file has no valid loop tags.
+        """
+        try:
+            loop_start, loop_end = self.read_tags(None, None)
+        except Exception as e:
+            logging.debug(f"No embedded loop points read from \"{self.filename}\": {e}")
+            return None
+
+        if not 0 <= loop_start < loop_end <= self.mlaudio.length:
+            logging.warning(
+                f"Ignoring embedded loop points of \"{self.filename}\" ({loop_start}, {loop_end}):"
+                f" outside the audio's range of {self.mlaudio.length} samples."
+            )
+            return None
+
+        logging.info(f"Found embedded loop points in the metadata tags: {loop_start} -> {loop_end}")
+
+        # Metadata loop points are not analyzed, so the similarity metrics are nominal
+        return LoopPair(
+            _loop_start_frame_idx=self.samples_to_frames(loop_start),
+            _loop_end_frame_idx=self.samples_to_frames(loop_end),
+            note_distance=0.0,
+            loudness_difference=0.0,
+            score=1.0,
+            loop_start=loop_start,
+            loop_end=loop_end,
+            from_metadata=True,
         )
 
     @property
@@ -251,22 +304,83 @@ class MusicLooper:
             if disable_fade_out:
                 sf.buffer_write(outro.tobytes(order="C"), dtype)
 
-        # attempt to copy over the tags
+        self._copy_tags(output_file_path)
+
+        return output_file_path
+
+    def trim(
+        self,
+        loop_end: int,
+        keep_after: int = 0,
+        output_dir: Optional[str] = None,
+    ) -> str:
+        """Losslessly cuts the audio `keep_after` samples after the loop end, removing the rest of the track.
+        The original container, bit depth and tags are kept; only WAV, FLAC and Ogg Vorbis files are supported.
+        Ogg Vorbis files are trimmed at the container level, without re-encoding the audio.
+        Returns the path to the trimmed audio file.
+
+        Args:
+            loop_end (int): Loop end in samples.
+            keep_after (int, optional): Number of samples to keep after the loop end. Defaults to 0.
+            output_dir (str, optional): Path to the output directory. Defaults to the same directory as the source audio file.
+
+        Raises:
+            ValueError: if the source file is not a PCM/float WAV, FLAC or single-stream Ogg Vorbis file.
+        """
+        info = soundfile.info(self.filepath)
+        is_ogg_vorbis = info.format == "OGG" and info.subtype == "VORBIS"
+        if not is_ogg_vorbis and (
+            info.format not in ("WAV", "FLAC")
+            or not (info.subtype.startswith("PCM_") or info.subtype in ("FLOAT", "DOUBLE"))
+        ):
+            raise ValueError(
+                f"Lossless trimming is only supported for PCM/float WAV, FLAC and Ogg Vorbis files; \"{self.filename}\" is {info.format} ({info.subtype})."
+            )
+
+        if output_dir is None:
+            output_dir = os.path.dirname(os.path.abspath(self.mlaudio.filepath))
+
+        track_name, file_extension = os.path.splitext(self.mlaudio.filename)
+        output_file_path = os.path.join(output_dir, f"{track_name}-trimmed{file_extension}")
+
+        if is_ogg_vorbis:
+            # The pages holding the tags are copied verbatim, so the tags are kept as-is
+            trim_vorbis(self.filepath, output_file_path, loop_end + keep_after)
+            return output_file_path
+
+        # Read the samples in their native representation so that writing them back is bit-exact
+        dtype = {"FLOAT": "float32", "DOUBLE": "float64"}.get(info.subtype, "int32")
+        n_frames = min(info.frames, loop_end + keep_after)
+        audio, rate = soundfile.read(self.filepath, frames=n_frames, dtype=dtype, always_2d=True)
+
+        soundfile.write(
+            output_file_path,
+            audio,
+            rate,
+            format=info.format,
+            subtype=info.subtype,
+            endian=info.endian,
+        )
+
+        self._copy_tags(output_file_path)
+
+        return output_file_path
+
+    def _copy_tags(self, dest_filepath: str):
+        """Attempts to copy the metadata tags of the source audio file to `dest_filepath`."""
         try:
             import taglib
             original_tags = None
             with taglib.File(self.filepath, save_on_exit=False) as src_file:
                 original_tags = src_file.tags
 
-            with taglib.File(output_file_path, save_on_exit=True) as dest_file:
+            with taglib.File(dest_filepath, save_on_exit=True) as dest_file:
                 for tag in original_tags:
                     dest_file.tags[tag] = original_tags[tag]
         except Exception:
             # silently ignore errors for now;
             # TODO: implement logging for debugging
             pass
-
-        return output_file_path
 
     def export_txt(
         self,

@@ -112,3 +112,173 @@ def test_extend_copies_source_tags(flac_track_path, tmp_path):
 
     with taglib.File(output_path) as extended:
         assert extended.tags["TITLE"] == ["Test Track"]
+
+
+# --- Embedded loop points ---
+
+
+def _write_loop_tags(path: str, loop_start: int, loop_end: int):
+    with taglib.File(path, save_on_exit=True) as audio_file:
+        audio_file.tags["LOOP_START"] = [str(loop_start)]
+        audio_file.tags["LOOP_END"] = [str(loop_end)]
+
+
+def test_find_loop_pairs_puts_embedded_tags_first(flac_track_path):
+    _write_loop_tags(flac_track_path, LOOP_START + 123, LOOP_END + 123)
+
+    pairs = MusicLooper(flac_track_path).find_loop_pairs()
+
+    assert pairs[0].from_metadata
+    assert (pairs[0].loop_start, pairs[0].loop_end) == (LOOP_START + 123, LOOP_END + 123)
+    assert len(pairs) > 1, "detected loop points should still follow the embedded ones"
+    assert not any(pair.from_metadata for pair in pairs[1:])
+
+
+def test_find_loop_pairs_can_ignore_embedded_tags(flac_track_path):
+    _write_loop_tags(flac_track_path, LOOP_START + 123, LOOP_END + 123)
+
+    pairs = MusicLooper(flac_track_path).find_loop_pairs(use_embedded_tags=False)
+
+    assert not any(pair.from_metadata for pair in pairs)
+
+
+def test_find_loop_pairs_ignores_embedded_tags_with_approx_position(flac_track_path):
+    _write_loop_tags(flac_track_path, LOOP_START + 123, LOOP_END + 123)
+
+    pairs = MusicLooper(flac_track_path).find_loop_pairs(
+        approx_loop_start=LOOP_START / SR, approx_loop_end=LOOP_END / SR
+    )
+
+    assert not any(pair.from_metadata for pair in pairs)
+
+
+def test_embedded_tags_out_of_range_are_ignored(flac_track_path, track):
+    _write_loop_tags(flac_track_path, LOOP_START, track.size + 1)
+
+    assert MusicLooper(flac_track_path).read_embedded_loop_pair() is None
+
+
+def test_no_embedded_tags(track_path):
+    assert MusicLooper(track_path).read_embedded_loop_pair() is None
+
+
+# --- Lossless trim ---
+
+
+@pytest.mark.parametrize(
+    ("filename", "subtype", "dtype"),
+    [
+        ("pcm16.wav", "PCM_16", "int16"),
+        ("pcm24.flac", "PCM_24", "int32"),
+        ("float.wav", "FLOAT", "float32"),
+    ],
+)
+def test_trim_is_bit_exact(track, tmp_path, filename, subtype, dtype):
+    source_path = tmp_path / filename
+    sf.write(source_path, np.stack([track, 0.8 * track], axis=1), SR, subtype=subtype)
+    out_dir = tmp_path / "out"
+    out_dir.mkdir()
+
+    output_path = MusicLooper(str(source_path)).trim(LOOP_END, keep_after=100, output_dir=str(out_dir))
+
+    source, _ = sf.read(source_path, dtype=dtype)
+    trimmed, rate = sf.read(output_path, dtype=dtype)
+    assert rate == SR
+    assert sf.info(output_path).subtype == subtype
+    assert os.path.basename(output_path) == f"{os.path.splitext(filename)[0]}-trimmed{os.path.splitext(filename)[1]}"
+    np.testing.assert_array_equal(trimmed, source[: LOOP_END + 100])
+
+
+def test_trim_keep_after_past_track_end_keeps_whole_track(flac_track_path, track, tmp_path):
+    output_path = MusicLooper(flac_track_path).trim(LOOP_END, keep_after=10 * track.size, output_dir=str(tmp_path))
+
+    assert sf.info(output_path).frames == track.size
+
+
+def test_trim_copies_source_tags(flac_track_path, tmp_path):
+    out_dir = tmp_path / "out"
+    out_dir.mkdir()
+    with taglib.File(flac_track_path, save_on_exit=True) as source:
+        source.tags["LOOP_START"] = [str(LOOP_START)]
+        source.tags["LOOP_END"] = [str(LOOP_END)]
+
+    output_path = MusicLooper(flac_track_path).trim(LOOP_END, output_dir=str(out_dir))
+
+    assert MusicLooper(output_path).read_tags(None, None) == (LOOP_START, LOOP_END)
+
+
+@pytest.mark.parametrize("keep_after", [0, 777])
+def test_trim_ogg_vorbis_without_reencoding(track, tmp_path, keep_after):
+    source_path = tmp_path / "track.ogg"
+    sf.write(source_path, np.stack([track, 0.8 * track], axis=1), SR, format="OGG", subtype="VORBIS")
+    with taglib.File(str(source_path), save_on_exit=True) as source:
+        source.tags["LOOPSTART"] = [str(LOOP_START)]
+        source.tags["LOOPLENGTH"] = [str(LOOP_END - LOOP_START)]
+    out_dir = tmp_path / "out"
+    out_dir.mkdir()
+
+    output_path = MusicLooper(str(source_path)).trim(LOOP_END, keep_after=keep_after, output_dir=str(out_dir))
+
+    source, _ = sf.read(source_path, dtype="float32")
+    trimmed, _ = sf.read(output_path, dtype="float32")
+    assert os.path.basename(output_path) == "track-trimmed.ogg"
+    np.testing.assert_array_equal(trimmed, source[: LOOP_END + keep_after])
+    assert MusicLooper(output_path).read_tags(None, None) == (LOOP_START, LOOP_END)
+
+
+def test_trim_ogg_vorbis_past_track_end_keeps_whole_track(track, tmp_path):
+    source_path = tmp_path / "track.ogg"
+    sf.write(source_path, track, SR, format="OGG", subtype="VORBIS")
+    out_dir = tmp_path / "out"
+    out_dir.mkdir()
+
+    output_path = MusicLooper(str(source_path)).trim(LOOP_END, keep_after=10 * track.size, output_dir=str(out_dir))
+
+    assert open(output_path, "rb").read() == open(source_path, "rb").read()
+
+
+@pytest.mark.parametrize(
+    ("filename", "format", "subtype"),
+    [
+        ("track.opus", "OGG", "OPUS"),
+        ("track.mp3", "MP3", "MPEG_LAYER_III"),
+        ("ulaw.wav", "WAV", "ULAW"),
+    ],
+)
+def test_trim_rejects_unsupported_formats(track, tmp_path, filename, format, subtype):
+    source_path = tmp_path / filename
+    sf.write(source_path, track, SR if subtype != "OPUS" else 48000, format=format, subtype=subtype)
+
+    with pytest.raises(ValueError):
+        MusicLooper(str(source_path)).trim(LOOP_END, output_dir=str(tmp_path))
+
+
+def test_ogg_vorbis_packet_durations_match_granule_positions(track, tmp_path):
+    from pymusiclooper.ogg import _find_packet_cut, _read_pages
+
+    source_path = tmp_path / "track.ogg"
+    sf.write(source_path, np.stack([track, 0.8 * track], axis=1), SR, format="OGG", subtype="VORBIS")
+    pages = list(_read_pages(source_path.read_bytes()))
+
+    # Raises if the computed packet durations do not add up to the page granule positions
+    for n_samples in range(1, track.size, 997):
+        assert _find_packet_cut(pages, n_samples) is not None
+    assert _find_packet_cut(pages, track.size + 1) is None
+
+
+def test_trim_ogg_vorbis_falls_back_to_page_level_cut(track, tmp_path, monkeypatch):
+    from pymusiclooper import ogg
+
+    def fail(*args, **kwargs):
+        raise ValueError("unparseable")
+
+    monkeypatch.setattr(ogg, "_find_packet_cut", fail)
+    source_path = tmp_path / "track.ogg"
+    sf.write(source_path, track, SR, format="OGG", subtype="VORBIS")
+    output_path = tmp_path / "trimmed.ogg"
+
+    assert ogg.trim_vorbis(str(source_path), str(output_path), LOOP_END) == LOOP_END
+
+    source, _ = sf.read(source_path, dtype="float32")
+    trimmed, _ = sf.read(output_path, dtype="float32")
+    np.testing.assert_array_equal(trimmed, source[:LOOP_END])

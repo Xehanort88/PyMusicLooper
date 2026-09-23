@@ -20,6 +20,7 @@ class LoopPair:
         note_distance: float
         loudness_difference: float
         score: float. Defaults to 0.
+        from_metadata: bool (loop points were read from the file's metadata tags instead of being detected). Defaults to False.
     """
 
     _loop_start_frame_idx: int
@@ -29,6 +30,7 @@ class LoopPair:
     score: float = 0
     loop_start: int = 0
     loop_end: int = 0
+    from_metadata: bool = False
 
 
 def find_best_loop_points(

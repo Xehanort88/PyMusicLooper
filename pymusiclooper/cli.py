@@ -77,6 +77,7 @@ def common_loop_options(f):
     @click.option('--approx-loop-position', type=click.FloatRange(min=0), nargs=2, default=None, help='The approximate desired loop start and loop end in seconds. [dim]([cyan]+/-2[/] second search window for each point)[/]')
     @click.option("--brute-force", is_flag=True, default=False, help=r"Check the entire audio track instead of just the detected beats. [dim yellow](Warning: may take several minutes to complete.)[/]")
     @click.option("--disable-pruning", is_flag=True, default=False, help="Disables filtering of the detected loop points from the initial pass.")
+    @click.option("--ignore-tags", is_flag=True, default=False, help="Ignore loop points already stored in the file's metadata tags (e.g. LOOP_START/LOOP_END), which are otherwise used as the first choice.")
 
     @functools.wraps(f)
     def wrapper_common_options(*args, **kwargs):
@@ -123,12 +124,13 @@ def play(**kwargs):
         start_time = handler.format_time(chosen_loop_pair.loop_start, in_samples=in_samples)
         end_time = handler.format_time(chosen_loop_pair.loop_end, in_samples=in_samples)
 
+        source = (
+            "loop points from metadata tags"
+            if chosen_loop_pair.from_metadata
+            else f"similarity: {chosen_loop_pair.score:.2%}"
+        )
         rich_console.print(
-            "\nPlaying with looping active from [green]{}[/] back to [green]{}[/]; similarity: {:.2%}".format(
-                end_time,
-                start_time,
-                chosen_loop_pair.score,
-            )
+            f"\nPlaying with looping active from [green]{end_time}[/] back to [green]{start_time}[/]; {source}"
         )
         rich_console.print("(Press [red]Ctrl+C[/] to stop looping.)")
 
@@ -223,6 +225,17 @@ def export_points(**kwargs):
 @click.option("--tag-offset/--no-tag-offset", is_flag=True, default=None, help="Always export second loop metadata tag as a relative length / or as an absolute length. Default: auto-detected based on tag name.")
 def tag(**kwargs):
     """Adds metadata tags of loop points to a copy of the input audio file(s)."""
+    run_handler(**kwargs)
+
+
+@cli_main.command()
+@common_path_options
+@common_loop_options
+@common_export_options
+@click.option('--keep-after', type=click.IntRange(min=0), default=0, show_default=True, help="Number of samples to keep after the loop end.")
+def trim(**kwargs):
+    """Losslessly cut the audio after the loop end, keeping its original format, bit depth and tags. [dim](WAV, FLAC and OGG Vorbis only)[/]"""
+    kwargs["trim"] = True
     run_handler(**kwargs)
 
 
