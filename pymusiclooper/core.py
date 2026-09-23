@@ -327,26 +327,40 @@ class MusicLooper:
         Raises:
             ValueError: if the source file is not a PCM/float WAV, FLAC or single-stream Ogg Vorbis file.
         """
-        info = soundfile.info(self.filepath)
-        is_ogg_vorbis = info.format == "OGG" and info.subtype == "VORBIS"
-        if not is_ogg_vorbis and (
-            info.format not in ("WAV", "FLAC")
-            or not (info.subtype.startswith("PCM_") or info.subtype in ("FLOAT", "DOUBLE"))
-        ):
-            raise ValueError(
-                f"Lossless trimming is only supported for PCM/float WAV, FLAC and Ogg Vorbis files; \"{self.filename}\" is {info.format} ({info.subtype})."
-            )
-
         if output_dir is None:
             output_dir = os.path.dirname(os.path.abspath(self.mlaudio.filepath))
 
         track_name, file_extension = os.path.splitext(self.mlaudio.filename)
         output_file_path = os.path.join(output_dir, f"{track_name}-trimmed{file_extension}")
 
-        if is_ogg_vorbis:
+        self._trim_to(output_file_path, loop_end, keep_after)
+
+        return output_file_path
+
+    def supports_lossless_trim(self) -> bool:
+        """Returns whether the source file's format can be losslessly trimmed with `trim`."""
+        return self._supports_lossless_trim(soundfile.info(self.filepath))
+
+    @staticmethod
+    def _supports_lossless_trim(info) -> bool:
+        if info.format == "OGG":
+            return info.subtype == "VORBIS"
+        return info.format in ("WAV", "FLAC") and (
+            info.subtype.startswith("PCM_") or info.subtype in ("FLOAT", "DOUBLE")
+        )
+
+    def _trim_to(self, output_file_path: str, loop_end: int, keep_after: int):
+        """Writes the source audio, losslessly cut `keep_after` samples after the loop end, to `output_file_path`."""
+        info = soundfile.info(self.filepath)
+        if not self._supports_lossless_trim(info):
+            raise ValueError(
+                f"Lossless trimming is only supported for PCM/float WAV, FLAC and Ogg Vorbis files; \"{self.filename}\" is {info.format} ({info.subtype})."
+            )
+
+        if info.format == "OGG":
             # The pages holding the tags are copied verbatim, so the tags are kept as-is
             trim_vorbis(self.filepath, output_file_path, loop_end + keep_after)
-            return output_file_path
+            return
 
         # Read the samples in their native representation so that writing them back is bit-exact
         dtype = {"FLOAT": "float32", "DOUBLE": "float64"}.get(info.subtype, "int32")
@@ -363,8 +377,6 @@ class MusicLooper:
         )
 
         self._copy_tags(output_file_path)
-
-        return output_file_path
 
     def _copy_tags(self, dest_filepath: str):
         """Attempts to copy the metadata tags of the source audio file to `dest_filepath`."""
@@ -479,7 +491,9 @@ class MusicLooper:
         loop_start_tag: str,
         loop_end_tag: str,
         is_offset: Optional[bool] = None,
-        output_dir: Optional[str] = None
+        output_dir: Optional[str] = None,
+        trim: bool = False,
+        keep_after: int = 0,
     ) -> Tuple[str]:
         """Adds metadata tags of loop points to a copy of the source audio file.
 
@@ -490,6 +504,11 @@ class MusicLooper:
             loop_end_tag (str): Name of the loop_end metadata tag.
             is_offset (bool, optional): Export second tag as relative length / absolute end. Defaults to auto-detecting based on tag name.
             output_dir (str, optional): Path to the output directory. Defaults to the same diretcory as the source audio file.
+            trim (bool, optional): Also losslessly cut the tagged copy `keep_after` samples after the loop end (see `trim`). Defaults to False.
+            keep_after (int, optional): Number of samples to keep after the loop end when trimming. Defaults to 0.
+
+        Raises:
+            ValueError: if `trim` is set and the source file does not support lossless trimming.
         """
         # Workaround for taglib import issues on Apple silicon devices
         # Import taglib only when needed to isolate ImportErrors
@@ -503,7 +522,10 @@ class MusicLooper:
         exported_file_path = os.path.join(
             output_dir, f"{track_name}-tagged{file_extension}"
         )
-        shutil.copyfile(self.mlaudio.filepath, exported_file_path)
+        if trim:
+            self._trim_to(exported_file_path, loop_end, keep_after)
+        else:
+            shutil.copyfile(self.mlaudio.filepath, exported_file_path)
 
         # Handle LOOPLENGTH tag
         if self._end_tag_is_offset(loop_end_tag, is_offset):

@@ -1,6 +1,8 @@
 import os
 
 import pytest
+import soundfile as sf
+from conftest import SR
 
 from pymusiclooper import handler
 from pymusiclooper.analysis import LoopPair
@@ -44,6 +46,99 @@ def test_interactive_reprompts_on_invalid_input(fake_input):
 def test_interactive_more_then_select(fake_input):
     fake_input("more", "27", "1")
     assert _bare_loop_handler().interactive_handler() == 27
+
+
+@pytest.mark.parametrize("interrupt", [KeyboardInterrupt, EOFError])
+def test_interactive_exits_cleanly_on_interrupt(monkeypatch, interrupt):
+    def raise_interrupt(*args, **kwargs):
+        raise interrupt
+    monkeypatch.setattr(handler.rich_console, "input", raise_interrupt)
+    monkeypatch.setattr(handler.signal, "signal", lambda *args: None)
+    with pytest.raises(SystemExit):
+        _bare_loop_handler().interactive_handler()
+
+
+@pytest.mark.parametrize(
+    ("answers", "expected"),
+    [
+        (("",), (False, 0)),
+        (("n",), (False, 0)),
+        (("y", ""), (True, handler.RECOMMENDED_KEEP_AFTER)),
+        (("Y", "0"), (True, 0)),
+        (("yes", "abc", "-5", "1.5", "10"), (True, 10)),
+    ],
+)
+def test_trim_prompt(fake_input, answers, expected):
+    fake_input(*answers)
+    assert LoopExportHandler.trim_prompt(None) == expected
+
+
+def test_trim_prompt_exits_cleanly_on_interrupt(monkeypatch):
+    def raise_interrupt(*args, **kwargs):
+        raise EOFError
+    monkeypatch.setattr(handler.rich_console, "input", raise_interrupt)
+    monkeypatch.setattr(handler.signal, "signal", lambda *args: None)
+    with pytest.raises(SystemExit):
+        LoopExportHandler.trim_prompt(None)
+
+
+def _interactive_export_handler(monkeypatch, source_path, output_dir, **kwargs):
+    monkeypatch.setenv("PML_INTERACTIVE_MODE", "1")
+    monkeypatch.setattr(handler.rich_console, "print", lambda *args, **kwargs: None)
+    return LoopExportHandler(path=str(source_path), min_duration_multiplier=0.35, output_dir=str(output_dir), **kwargs)
+
+
+def test_interactive_tag_with_trim_prompt_writes_single_file(monkeypatch, fake_input, track, tmp_path):
+    source_path = tmp_path / "track.flac"
+    sf.write(source_path, track, SR)
+    out_dir = tmp_path / "out"
+    export_handler = _interactive_export_handler(monkeypatch, source_path, out_dir, tag_names=("LOOPSTART", "LOOPLENGTH"))
+    loop_pair = export_handler.loop_pair_list[0]
+
+    fake_input("0", "y", "")
+    export_handler.run()
+
+    assert os.listdir(out_dir) == ["track-tagged.flac"]
+    tagged = MusicLooper(str(out_dir / "track-tagged.flac"))
+    assert tagged.read_tags("LOOPSTART", "LOOPLENGTH") == (loop_pair.loop_start, loop_pair.loop_end)
+    assert sf.info(out_dir / "track-tagged.flac").frames == loop_pair.loop_end + handler.RECOMMENDED_KEEP_AFTER
+
+
+def test_interactive_trim_prompt_declined(monkeypatch, fake_input, track, tmp_path):
+    source_path = tmp_path / "track.flac"
+    sf.write(source_path, track, SR)
+    out_dir = tmp_path / "out"
+    export_handler = _interactive_export_handler(monkeypatch, source_path, out_dir, tag_names=("LOOP_START", "LOOP_END"))
+
+    fake_input("0", "")
+    export_handler.run()
+
+    assert os.listdir(out_dir) == ["track-tagged.flac"]
+    assert sf.info(out_dir / "track-tagged.flac").frames == track.size
+
+
+def test_interactive_trim_prompt_skipped_for_unsupported_formats(monkeypatch, fake_input, track, tmp_path):
+    source_path = tmp_path / "track.mp3"
+    sf.write(source_path, track, SR, format="MP3")
+    export_handler = _interactive_export_handler(monkeypatch, source_path, tmp_path / "out", to_stdout=True)
+
+    # Only the loop selection is answered; a trim prompt would exhaust the answers
+    fake_input("0")
+    export_handler.run()
+
+
+def test_interactive_trim_command_does_not_prompt_again(monkeypatch, fake_input, track, tmp_path):
+    source_path = tmp_path / "track.flac"
+    sf.write(source_path, track, SR)
+    out_dir = tmp_path / "out"
+    export_handler = _interactive_export_handler(monkeypatch, source_path, out_dir, trim=True, keep_after=7)
+    loop_pair = export_handler.loop_pair_list[0]
+
+    fake_input("0")
+    export_handler.run()
+
+    assert os.listdir(out_dir) == ["track-trimmed.flac"]
+    assert sf.info(out_dir / "track-trimmed.flac").frames == loop_pair.loop_end + 7
 
 
 def test_choose_loop_pair_defaults_to_best():
