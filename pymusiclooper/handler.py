@@ -1,5 +1,6 @@
 import logging
 import os
+import signal
 import sys
 from contextlib import contextmanager
 from typing import List, Literal, Optional, Tuple
@@ -176,8 +177,12 @@ class LoopHandler:
                 return get_user_input()
 
             return selected_index
-        except KeyboardInterrupt:
+        # On Windows, Ctrl+C at the prompt can surface as an EOFError, with the
+        # actual interrupt delivered moments later
+        except (KeyboardInterrupt, EOFError):
             rich_console.print("\n[red]Operation terminated by user. Exiting.[/]")
+            # Ignore further Ctrl+C so that a late interrupt does not break the audio cleanup at exit
+            signal.signal(signal.SIGINT, signal.SIG_IGN)
             sys.exit()
 
 

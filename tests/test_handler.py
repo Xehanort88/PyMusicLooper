@@ -46,6 +46,16 @@ def test_interactive_more_then_select(fake_input):
     assert _bare_loop_handler().interactive_handler() == 27
 
 
+@pytest.mark.parametrize("interrupt", [KeyboardInterrupt, EOFError])
+def test_interactive_exits_cleanly_on_interrupt(monkeypatch, interrupt):
+    def raise_interrupt(*args, **kwargs):
+        raise interrupt
+    monkeypatch.setattr(handler.rich_console, "input", raise_interrupt)
+    monkeypatch.setattr(handler.signal, "signal", lambda *args: None)
+    with pytest.raises(SystemExit):
+        _bare_loop_handler().interactive_handler()
+
+
 def test_choose_loop_pair_defaults_to_best():
     loop_handler = _bare_loop_handler()
     assert loop_handler.choose_loop_pair(interactive_mode=False) is loop_handler.loop_pair_list[0]
