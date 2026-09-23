@@ -41,7 +41,6 @@ def test_interactive_reprompts_on_invalid_input(fake_input):
     assert _bare_loop_handler().interactive_handler() == 4
 
 
-@pytest.mark.xfail(strict=True, reason="bug: the choice made after 'more'/'all'/'reset' is discarded and the user is prompted again")
 def test_interactive_more_then_select(fake_input):
     fake_input("more", "27", "1")
     assert _bare_loop_handler().interactive_handler() == 27
@@ -52,7 +51,6 @@ def test_choose_loop_pair_defaults_to_best():
     assert loop_handler.choose_loop_pair(interactive_mode=False) is loop_handler.loop_pair_list[0]
 
 
-@pytest.mark.xfail(strict=True, reason="bug: success message names loop.txt but the file written is loops.txt")
 def test_txt_export_message_names_written_file(monkeypatch, track_path, tmp_path):
     export_handler = LoopExportHandler.__new__(LoopExportHandler)
     export_handler._musiclooper = MusicLooper(track_path)

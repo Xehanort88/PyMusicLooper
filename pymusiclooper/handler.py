@@ -132,11 +132,11 @@ class LoopHandler:
                 preview = False
 
                 if num_input == "more":
-                    self.interactive_handler(show_top=show_top * 2)
+                    return self.interactive_handler(show_top=show_top * 2)
                 if num_input == "all":
-                    self.interactive_handler(show_top=total_candidates)
+                    return self.interactive_handler(show_top=total_candidates)
                 if num_input == "reset":
-                    self.interactive_handler()
+                    return self.interactive_handler()
 
                 if num_input[-1] == "p":
                     idx = int(num_input[:-1])
@@ -322,12 +322,11 @@ class LoopExportHandler(LoopHandler):
         if self.alt_export_top != 0:
             self.alt_export_runner(mode="TXT")
         else:
-            self.musiclooper.export_txt(
+            out_path = self.musiclooper.export_txt(
                 self._fmt(loop_start),
                 self._fmt(loop_end),
                 output_dir=self.output_directory,
             )
-            out_path = os.path.join(self.output_directory, "loop.txt")
             message = f'Successfully added "{self.musiclooper.filename}" loop points to "{out_path}"'
             if self.batch_mode:
                 logging.info(message)

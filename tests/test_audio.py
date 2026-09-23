@@ -29,7 +29,6 @@ def test_analysis_signal_is_normalized_mono(stereo_track_path):
     assert np.max(np.abs(audio.audio)) == pytest.approx(1.0)
 
 
-@pytest.mark.xfail(strict=True, reason="bug: for mono input, to_mono returns the same array, so normalizing it in place also rescales the playback/export audio")
 def test_playback_audio_is_untouched(track_path, track):
     audio = MLAudio(track_path)
     np.testing.assert_array_equal(audio.playback_audio[:, 0], track)

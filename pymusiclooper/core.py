@@ -206,10 +206,12 @@ class MusicLooper:
             samples_to_fade = min(
                 self.mlaudio.seconds_to_samples(fade_length), final_loop.shape[0]
             )
-            final_loop[-samples_to_fade:] = (
-                final_loop[-samples_to_fade:]
-                * np.linspace(1, 0, samples_to_fade)[:, np.newaxis]
-            )
+            # Guard against x[-0:], which would select the whole section
+            if samples_to_fade > 0:
+                final_loop[-samples_to_fade:] = (
+                    final_loop[-samples_to_fade:]
+                    * np.linspace(1, 0, samples_to_fade)[:, np.newaxis]
+                )
 
         # Format extended file name with its duration suffixed
         extended_loop_length = final_loop.shape[0] + (
@@ -272,9 +274,10 @@ class MusicLooper:
         loop_end: Union[str, int, float, str],
         txt_name: str = "loops",
         output_dir: Optional[str] = None
-    ):
-        """Exports the given loop points to a text file named `loop.txt` in append mode with the format:
+    ) -> str:
+        """Exports the given loop points to a text file named `loops.txt` in append mode with the format:
         `{loop_start} {loop_end} {filename}`
+        Returns the path to the text file.
 
         Args:
             loop_start (Union[int, float, str]): Loop start in samples, seconds or ftime.
@@ -289,6 +292,8 @@ class MusicLooper:
 
         with open(out_path, "a") as file:
             file.write(f"{loop_start} {loop_end} {self.mlaudio.filename}\n")
+
+        return out_path
 
 
     def _find_start_tag(
@@ -377,7 +382,7 @@ class MusicLooper:
         import taglib
             
         if output_dir is None:
-            output_dir = os.path.abspath(self.mlaudio.filepath)
+            output_dir = os.path.dirname(os.path.abspath(self.mlaudio.filepath))
 
         track_name, file_extension = os.path.splitext(self.mlaudio.filename)
 

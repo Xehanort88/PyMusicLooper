@@ -55,7 +55,6 @@ def test_extend_shorter_than_track_raises(looper, tmp_path):
         looper.extend(LOOP_START, LOOP_END, extended_length=5, output_dir=str(tmp_path))
 
 
-@pytest.mark.xfail(strict=True, reason="bug: fade_length=0 slices the whole final loop section (x[-0:]) and fails to broadcast")
 def test_extend_with_zero_fade_length(looper, tmp_path):
     looper.extend(LOOP_START, LOOP_END, extended_length=60, fade_length=0, format="WAV", output_dir=str(tmp_path))
 
@@ -98,7 +97,6 @@ def test_read_tags_without_loop_tags_raises(flac_track_path):
         MusicLooper(flac_track_path).read_tags(None, None)
 
 
-@pytest.mark.xfail(strict=True, reason="bug: export_tags defaults output_dir to the source file path instead of its directory")
 def test_export_tags_defaults_to_source_directory(flac_track_path, tmp_path):
     MusicLooper(flac_track_path).export_tags(LOOP_START, LOOP_END, "LOOP_START", "LOOP_END")
     assert (tmp_path / "track-tagged.flac").exists()

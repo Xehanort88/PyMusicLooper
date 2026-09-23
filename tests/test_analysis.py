@@ -76,7 +76,6 @@ def test_impossible_constraints_raise(looper):
         looper.find_loop_pairs(min_loop_duration=60)
 
 
-@pytest.mark.xfail(strict=True, reason="bug: _prioritize_duration runs before loop_start/loop_end are set, so it never reorders anything")
 def test_prioritize_duration_sees_real_loop_positions(monkeypatch, looper):
     durations_seen = []
     original = analysis._prioritize_duration
@@ -130,7 +129,6 @@ def test_unrelated_sequences_score_lower():
     assert unrelated < matching
 
 
-@pytest.mark.xfail(strict=True, reason="bug: truncated look-behind windows are zero-padded on the side nearest the loop point")
 def test_truncated_lookbehind_weights_frames_nearest_the_loop_point():
     chroma = _random_chroma()
     # Only 3 frames exist before b1=3; they match the 3 frames before b2=100

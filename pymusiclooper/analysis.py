@@ -172,10 +172,6 @@ def find_best_loop_points(
         mlaudio, chroma, bpm, candidate_pairs, disable_pruning
     )
 
-    # prefer longer loops for highly similar sequences
-    if len(filtered_candidate_pairs) > 1:
-        _prioritize_duration(filtered_candidate_pairs)
-
     # Set the exact loop start and end in samples and adjust them
     # to the nearest zero crossing. Avoids audio popping/clicking while looping
     # as much as possible.
@@ -202,6 +198,11 @@ def find_best_loop_points(
         raise LoopNotFoundError(
             f"No loop points found for {mlaudio.filename} with current parameters."
         )
+
+    # prefer longer loops for highly similar sequences
+    # (must run after the loop positions in samples are set, since it compares loop durations)
+    if len(filtered_candidate_pairs) > 1:
+        _prioritize_duration(filtered_candidate_pairs)
 
     logging.info(
         f"Filtered to {len(filtered_candidate_pairs)} best candidate loop points"
@@ -522,8 +523,12 @@ def _calculate_subseq_beat_similarity(
     cosine_sim = dot_prod / (np.maximum(b1_norm * b2_norm, 1e-10))
 
     if max_offset < test_length:
+        # Pad the missing frames on the side farthest from the loop point:
+        # after the tested frames when looking ahead, before them when looking behind
+        missing_frames = test_length - max_offset
+        pad_width = (missing_frames, 0) if test_end_offset < 0 else (0, missing_frames)
         return np.average(
-            np.pad(cosine_sim, pad_width=(0, test_length - max_offset), mode="constant", constant_values=0),
+            np.pad(cosine_sim, pad_width=pad_width, mode="constant", constant_values=0),
             weights=weights,
         )
     else:
