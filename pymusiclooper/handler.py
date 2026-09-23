@@ -25,6 +25,7 @@ class LoopHandler:
         approx_loop_position: Optional[tuple] = None,
         brute_force: bool = False,
         disable_pruning: bool = False,
+        ignore_tags: bool = False,
         _progressbar: Progress = None,
         **kwargs,
     ):
@@ -48,6 +49,7 @@ class LoopHandler:
             approx_loop_end=self.approx_loop_end,
             brute_force=brute_force,
             disable_pruning=disable_pruning,
+            use_embedded_tags=not ignore_tags,
         )
         self.interactive_mode = "PML_INTERACTIVE_MODE" in os.environ
         self.in_samples = "PML_DISPLAY_SAMPLES" in os.environ
@@ -109,17 +111,20 @@ class LoopHandler:
                 if self.in_samples
                 else preview_looper.samples_to_ftime(pair.loop_end - pair.loop_start)
             )
-            score = pair.score
-            loudness_difference = pair.loudness_difference
-            note_distance = pair.note_distance
+            if pair.from_metadata:
+                metrics = ("-", "-", "[bold]from tags[/]")
+            else:
+                metrics = (
+                    f"{pair.note_distance:.4f}",
+                    f"{pair.loudness_difference:.4f}",
+                    f"{pair.score:.2%}",
+                )
             table.add_row(
                 str(idx),
                 str(start_time),
                 str(end_time),
                 str(length),
-                f"{note_distance:.4f}",
-                f"{loudness_difference:.4f}",
-                f"{score:.2%}",
+                *metrics,
             )
 
         rich_console.print(table)
@@ -132,11 +137,11 @@ class LoopHandler:
                 preview = False
 
                 if num_input == "more":
-                    self.interactive_handler(show_top=show_top * 2)
+                    return self.interactive_handler(show_top=show_top * 2)
                 if num_input == "all":
-                    self.interactive_handler(show_top=total_candidates)
+                    return self.interactive_handler(show_top=total_candidates)
                 if num_input == "reset":
-                    self.interactive_handler()
+                    return self.interactive_handler()
 
                 if num_input[-1] == "p":
                     idx = int(num_input[:-1])
@@ -188,6 +193,7 @@ class LoopExportHandler(LoopHandler):
         approx_loop_position: Optional[tuple] = None,
         brute_force: bool = False,
         disable_pruning: bool = False,
+        ignore_tags: bool = False,
         split_audio: bool = False,
         format: Literal["WAV", "FLAC", "OGG", "MP3"] = "WAV",
         to_txt: bool = False,
@@ -200,6 +206,8 @@ class LoopExportHandler(LoopHandler):
         extended_length: float = 0,
         fade_length: float = 0,
         disable_fade_out: bool = False,
+        trim: bool = False,
+        keep_after: int = 0,
         **kwargs,
     ):
         super().__init__(
@@ -210,6 +218,7 @@ class LoopExportHandler(LoopHandler):
             approx_loop_position=approx_loop_position,
             brute_force=brute_force,
             disable_pruning=disable_pruning,
+            ignore_tags=ignore_tags,
             **kwargs,
         )
         self.output_directory = output_dir
@@ -225,6 +234,8 @@ class LoopExportHandler(LoopHandler):
         self.extended_length = extended_length
         self.disable_fade_out = disable_fade_out
         self.fade_length = fade_length
+        self.trim = trim
+        self.keep_after = keep_after
         self._is_autocreated_outdir = False
 
     def run(self):
@@ -245,6 +256,7 @@ class LoopExportHandler(LoopHandler):
                 or self.to_txt
                 or self.split_audio
                 or self.extended_length
+                or self.trim
             ) and not os.path.exists(self.output_directory):
                 os.mkdir(self.output_directory)
                 self._is_autocreated_outdir = True
@@ -260,6 +272,9 @@ class LoopExportHandler(LoopHandler):
 
             if self.extended_length:
                 self.extend_track_runner(loop_start, loop_end)
+
+            if self.trim:
+                self.trim_runner(loop_end)
         finally:
             if (
                 self._is_autocreated_outdir
@@ -318,16 +333,31 @@ class LoopExportHandler(LoopHandler):
         except ValueError as e:
             logging.error(e)
 
+    def trim_runner(self, loop_end: int):
+        try:
+            output_path = self.musiclooper.trim(
+                loop_end,
+                keep_after=self.keep_after,
+                output_dir=self.output_directory,
+            )
+            message = f'Successfully exported a trimmed version of "{self.musiclooper.filename}" to "{output_path}"'
+            if self.batch_mode:
+                logging.info(message)
+            else:
+                rich_console.print(message)
+        # Unsupported (lossy) source format
+        except ValueError as e:
+            logging.error(e)
+
     def txt_export_runner(self, loop_start: int, loop_end: int):
         if self.alt_export_top != 0:
             self.alt_export_runner(mode="TXT")
         else:
-            self.musiclooper.export_txt(
+            out_path = self.musiclooper.export_txt(
                 self._fmt(loop_start),
                 self._fmt(loop_end),
                 output_dir=self.output_directory,
             )
-            out_path = os.path.join(self.output_directory, "loop.txt")
             message = f'Successfully added "{self.musiclooper.filename}" loop points to "{out_path}"'
             if self.batch_mode:
                 logging.info(message)

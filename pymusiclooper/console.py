@@ -12,6 +12,7 @@ _loop_options = [
     "--approx-loop-position",
     "--brute-force",
     "--disable-pruning",
+    "--ignore-tags",
 ]
 _export_options = ["--output-dir", "--format"]
 _batch_options = ["--recursive", "--flatten"]
@@ -49,6 +50,7 @@ _OPTION_GROUPS = {
     "pymusiclooper tag": _option_groups(["--tag-names", "--tag-offset"]),
     "pymusiclooper export-points": _option_groups(["--export-to", "--alt-export-top", "--fmt"]),
     "pymusiclooper extend": _option_groups(["--extended-length", "--fade-length", "--disable-fade-out"]),
+    "pymusiclooper trim": _option_groups(["--keep-after"]),
 }
 _COMMAND_GROUPS = {
     "pymusiclooper": [
@@ -66,6 +68,7 @@ _COMMAND_GROUPS = {
                 "split-audio",
                 "tag",
                 "extend",
+                "trim",
             ],
         }
     ]

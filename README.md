@@ -119,6 +119,8 @@ pymusiclooper -i play --url "https://www.youtube.com/watch?v=dQw4w9WgXcQ"
 pymusiclooper play-tagged --path "TRACK_NAME.mp3" --tag-names LOOP_START LOOP_END
 ```
 
+*Note: if a file already has loop metadata tags (e.g. LOOP_START/LOOP_END or LOOPSTART/LOOPLENGTH), they are used as the first loop choice by all commands. Use `--ignore-tags` to skip them.*
+
 ### Export
 
 *Note: batch processing is available for all export subcommands. Simply specify a directory instead of a file as the path to be used.*
@@ -144,6 +146,10 @@ pymusiclooper export-points --path "/path/to/track.wav" --alt-export-top -1
 # Add metadata tags of the best discovered loop points to a copy of the input audio file
 # (or all audio files in a directory, if a directory path is used instead)
 pymusiclooper -i tag --path "TRACK_NAME.mp3" --tag-names LOOP_START LOOP_END
+
+# Losslessly cut everything after the loop end (WAV, FLAC and OGG Vorbis only), keeping 1000 samples past it
+# The original format, bit depth and tags are preserved; OGG files are cut without re-encoding
+pymusiclooper -i trim --path "TRACK_NAME.wav" --keep-after 1000
 
 
 # Export the loop points (in samples) of all tracks in a particular directory to a loops.txt file
