@@ -8,7 +8,9 @@ import soundfile as sf
 import taglib
 from conftest import INTRO_SAMPLES, PATTERN_SAMPLES, SR
 
+from pymusiclooper import core
 from pymusiclooper.core import MusicLooper
+from pymusiclooper.exceptions import LoopNotFoundError
 
 LOOP_START = INTRO_SAMPLES
 LOOP_END = INTRO_SAMPLES + 2 * PATTERN_SAMPLES
@@ -162,6 +164,39 @@ def test_embedded_tags_out_of_range_are_ignored(flac_track_path, track):
 
 def test_no_embedded_tags(track_path):
     assert MusicLooper(track_path).read_embedded_loop_pair() is None
+
+
+def test_tags_only_returns_embedded_tags_without_analysis(monkeypatch, flac_track_path):
+    _write_loop_tags(flac_track_path, LOOP_START + 123, LOOP_END + 123)
+
+    def fail_analysis(*args, **kwargs):
+        raise AssertionError("the audio should not be analyzed")
+    monkeypatch.setattr(core, "find_best_loop_points", fail_analysis)
+
+    pairs = MusicLooper(flac_track_path).find_loop_pairs(tags_only=True)
+
+    assert len(pairs) == 1
+    assert pairs[0].from_metadata
+    assert (pairs[0].loop_start, pairs[0].loop_end) == (LOOP_START + 123, LOOP_END + 123)
+
+
+def test_tags_only_without_tags_raises(flac_track_path):
+    with pytest.raises(LoopNotFoundError, match="No loop start tag"):
+        MusicLooper(flac_track_path).find_loop_pairs(tags_only=True)
+
+
+def test_tags_only_with_out_of_range_tags_raises(flac_track_path, track):
+    _write_loop_tags(flac_track_path, LOOP_START, track.size + 1)
+
+    with pytest.raises(LoopNotFoundError, match="do not fit in the audio"):
+        MusicLooper(flac_track_path).find_loop_pairs(tags_only=True)
+
+
+def test_tags_only_with_invalid_tag_value_raises(flac_track_path):
+    _write_loop_tags(flac_track_path, LOOP_START, "end")
+
+    with pytest.raises(LoopNotFoundError, match="invalid"):
+        MusicLooper(flac_track_path).find_loop_pairs(tags_only=True)
 
 
 # --- Lossless trim ---
