@@ -119,7 +119,7 @@ pymusiclooper -i play --url "https://www.youtube.com/watch?v=dQw4w9WgXcQ"
 pymusiclooper play-tagged --path "TRACK_NAME.mp3" --tag-names LOOP_START LOOP_END
 ```
 
-*Note: if a file already has loop metadata tags (e.g. LOOP_START/LOOP_END or LOOPSTART/LOOPLENGTH), they are used as the first loop choice by all commands. Use `--ignore-tags` to skip them.*
+*Note: if a file already has loop metadata tags (e.g. LOOP_START/LOOP_END or LOOPSTART/LOOPLENGTH), or is a WAV file with a loop in its sampler (`smpl`) chunk, those loop points are used as the first loop choice by all commands. Use `--ignore-tags` to skip them.*
 
 ### Export
 
@@ -145,16 +145,18 @@ pymusiclooper export-points --path "/path/to/track.wav" --alt-export-top -1
 
 # Add metadata tags of the best discovered loop points to a copy of the input audio file
 # (or all audio files in a directory, if a directory path is used instead)
+# WAV files also get the loop points in their sampler (`smpl`) chunk, which many game engines and samplers read
 pymusiclooper -i tag --path "TRACK_NAME.mp3" --tag-names LOOP_START LOOP_END
 
 # Losslessly cut everything after the loop end (WAV, FLAC and OGG Vorbis only), keeping 1000 samples past it
+# (100 by default, which avoids clicks in players that read slightly past the loop end; use 0 to cut exactly at it)
 # The original format, bit depth and metadata are preserved; WAV and OGG files are cut without re-encoding.
 # WAV and OGG files keep all their metadata (e.g. tags, WAV sampler loops and cue points);
 # FLAC files keep all theirs (e.g. tags and cover art) except the seek table and cue sheet, which no longer apply
 pymusiclooper -i trim --path "TRACK_NAME.wav" --keep-after 1000
 
 # In interactive mode, the other export subcommands also offer to trim WAV, FLAC and OGG Vorbis files
-# after the loop is chosen; with `tag`, a single tagged and trimmed copy is written
+# after the loop is chosen (except when printing loop points to the terminal); with `tag`, a single tagged and trimmed copy is written
 pymusiclooper -i tag --path "TRACK_NAME.ogg" --tag-names LOOPSTART LOOPLENGTH
 
 

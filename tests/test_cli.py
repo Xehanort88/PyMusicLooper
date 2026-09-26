@@ -91,3 +91,16 @@ def test_batch_export_skips_non_audio_files(run, track_path, stereo_track_path, 
     assert result.exit_code == 0
     lines = (out_dir / "loops.txt").read_text().splitlines()
     assert sorted(line.split()[-1] for line in lines) == ["stereo.wav", "track.wav"]
+
+
+def test_trim_keeps_recommended_samples_after_loop_end_by_default(run, track_path, tmp_path):
+    import soundfile as sf
+
+    from pymusiclooper.core import MusicLooper
+    from pymusiclooper.handler import RECOMMENDED_KEEP_AFTER
+
+    result = run("trim", "--path", track_path, "--output-dir", tmp_path)
+
+    assert result.exit_code == 0
+    loop_end = MusicLooper(track_path).find_loop_pairs()[0].loop_end
+    assert sf.info(tmp_path / "track-trimmed.wav").frames == loop_end + RECOMMENDED_KEEP_AFTER

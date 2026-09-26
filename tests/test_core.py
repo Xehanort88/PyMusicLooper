@@ -217,7 +217,7 @@ def _append_wav_chunk(path, chunk_id: bytes, chunk_data: bytes):
 def _wav_chunks(path) -> dict:
     from pymusiclooper.wav import _read_chunks
 
-    return {chunk.chunk_id: chunk.data for chunk in _read_chunks(path.read_bytes(), "<")}
+    return dict(_read_chunks(str(path))[2])
 
 
 @pytest.mark.parametrize(
@@ -549,3 +549,131 @@ def test_ogg_vorbis_start_granule_is_zero_for_regular_files(track, tmp_path):
     sf.write(source_path, track, SR, format="OGG", subtype="VORBIS")
 
     assert _start_granule(list(_read_pages(source_path.read_bytes()))) == 0
+
+
+# --- WAV sampler (smpl) chunk loop points ---
+
+
+def _smpl_chunk(loops, sampler_data=b"", manufacturer=7):
+    """A sampler chunk with the given (cue point ID, type, start, inclusive end) loops."""
+    header = struct.pack("<9I", manufacturer, 0, 45351, 60, 0, 0, 0, len(loops), len(sampler_data))
+    return header + b"".join(struct.pack("<6I", cue_id, loop_type, start, end, 0, 0) for cue_id, loop_type, start, end in loops) + sampler_data
+
+
+def test_smpl_loop_is_used_as_embedded_loop(track_path, tmp_path):
+    from pymusiclooper.wav import write_smpl_loop
+
+    source_path = tmp_path / "track.wav"
+    source_path.write_bytes(open(track_path, "rb").read())
+    write_smpl_loop(str(source_path), LOOP_START + 123, LOOP_END + 123, SR)
+    looper = MusicLooper(str(source_path))
+
+    assert looper.read_tags(None, None) == (LOOP_START + 123, LOOP_END + 123)
+    pair = looper.find_loop_pairs()[0]
+    assert pair.from_metadata
+    assert (pair.loop_start, pair.loop_end) == (LOOP_START + 123, LOOP_END + 123)
+    # Explicitly named tags are not replaced by the sampler loop
+    with pytest.raises(ValueError):
+        looper.read_tags("LOOP_START", "LOOP_END")
+
+
+def test_loop_tags_take_precedence_over_smpl_loop(track_path, tmp_path):
+    from pymusiclooper.wav import write_smpl_loop
+
+    source_path = tmp_path / "track.wav"
+    source_path.write_bytes(open(track_path, "rb").read())
+    write_smpl_loop(str(source_path), 1000, 2000, SR)
+    _write_loop_tags(str(source_path), LOOP_START, LOOP_END)
+
+    assert MusicLooper(str(source_path)).read_tags(None, None) == (LOOP_START, LOOP_END)
+
+
+def test_read_smpl_loop_uses_first_forward_loop(track_path, tmp_path):
+    from pymusiclooper.wav import read_smpl_loop
+
+    source_path = tmp_path / "track.wav"
+    source_path.write_bytes(open(track_path, "rb").read())
+    # A ping-pong loop first, then a forward loop
+    _append_wav_chunk(source_path, b"smpl", _smpl_chunk([(1, 1, 10, 20), (2, 0, 1000, 1999)]))
+
+    assert read_smpl_loop(str(source_path)) == (1000, 2000)
+
+
+@pytest.mark.parametrize("filename", ["track.flac", "track.ogg"])
+def test_read_smpl_loop_ignores_other_formats(track, tmp_path, filename):
+    from pymusiclooper.wav import read_smpl_loop
+
+    source_path = tmp_path / filename
+    sf.write(source_path, track, SR)
+
+    assert read_smpl_loop(str(source_path)) is None
+
+
+@pytest.mark.parametrize("trim", [False, True])
+def test_export_tags_writes_smpl_loop_to_wav(track_path, tmp_path, trim):
+    from pymusiclooper.wav import read_smpl_loop
+
+    written = MusicLooper(track_path).export_tags(
+        LOOP_START, LOOP_END, "LOOPSTART", "LOOPLENGTH", output_dir=str(tmp_path), trim=trim, keep_after=100
+    )
+
+    output_path = str(tmp_path / "track-tagged.wav")
+    assert written == (str(LOOP_START), str(LOOP_END - LOOP_START))
+    assert read_smpl_loop(output_path) == (LOOP_START, LOOP_END)
+    assert MusicLooper(output_path).read_tags("LOOPSTART", "LOOPLENGTH") == (LOOP_START, LOOP_END)
+    assert sf.info(output_path).frames == (LOOP_END + 100 if trim else sf.info(track_path).frames)
+    smpl = _wav_chunks(Path(output_path))[b"smpl"]
+    # Sample period in nanoseconds, MIDI unity note, one infinitely repeating forward loop with an inclusive end
+    assert struct.unpack_from("<9I", smpl)[2:4] == (round(1e9 / SR), 60)
+    assert struct.unpack_from("<9I", smpl)[7] == 1
+    assert struct.unpack_from("<6I", smpl, 36) == (0, 0, LOOP_START, LOOP_END - 1, 0, 0)
+
+
+def test_export_tags_does_not_write_smpl_loop_to_other_formats(flac_track_path, tmp_path):
+    MusicLooper(flac_track_path).export_tags(LOOP_START, LOOP_END, "LOOP_START", "LOOP_END", output_dir=str(tmp_path))
+
+    assert b"smpl" not in (tmp_path / "track-tagged.flac").read_bytes()
+
+
+def test_write_smpl_loop_keeps_existing_sampler_data(track_path, tmp_path):
+    from pymusiclooper.wav import write_smpl_loop
+
+    source_path = tmp_path / "track.wav"
+    source_path.write_bytes(open(track_path, "rb").read())
+    _append_wav_chunk(source_path, b"smpl", _smpl_chunk([(5, 0, 10, 20), (6, 1, 30, 40)], sampler_data=b"\x01\x02\x03\x04"))
+
+    write_smpl_loop(str(source_path), LOOP_START, LOOP_END, SR)
+
+    assert _wav_chunks(source_path)[b"smpl"] == _smpl_chunk(
+        [(5, 0, LOOP_START, LOOP_END - 1), (6, 1, 30, 40)], sampler_data=b"\x01\x02\x03\x04"
+    )
+    assert sf.info(source_path).frames == sf.info(track_path).frames
+
+
+def test_write_smpl_loop_adds_loop_to_sampler_chunk_without_loops(track_path, tmp_path):
+    from pymusiclooper.wav import write_smpl_loop
+
+    source_path = tmp_path / "track.wav"
+    source_path.write_bytes(open(track_path, "rb").read())
+    _append_wav_chunk(source_path, b"smpl", _smpl_chunk([], sampler_data=b"\x01\x02\x03\x04"))
+
+    write_smpl_loop(str(source_path), LOOP_START, LOOP_END, SR)
+
+    assert _wav_chunks(source_path)[b"smpl"] == _smpl_chunk(
+        [(0, 0, LOOP_START, LOOP_END - 1)], sampler_data=b"\x01\x02\x03\x04"
+    )
+
+
+def test_detected_loop_matching_embedded_loop_is_not_listed_twice(flac_track_path):
+    detected = MusicLooper(flac_track_path).find_loop_pairs(use_embedded_tags=False)[0]
+    _write_loop_tags(flac_track_path, detected.loop_start, detected.loop_end)
+
+    pairs = MusicLooper(flac_track_path).find_loop_pairs()
+
+    assert pairs[0].from_metadata
+    assert (pairs[0].loop_start, pairs[0].loop_end) == (detected.loop_start, detected.loop_end)
+    tolerance = int(0.005 * SR)
+    assert not any(
+        abs(pair.loop_start - detected.loop_start) <= tolerance and abs(pair.loop_end - detected.loop_end) <= tolerance
+        for pair in pairs[1:]
+    )

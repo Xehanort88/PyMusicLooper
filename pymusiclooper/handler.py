@@ -14,7 +14,7 @@ from pymusiclooper.core import MusicLooper
 from pymusiclooper.exceptions import AudioLoadError, LoopNotFoundError
 from pymusiclooper.utils import DEFAULT_OUTPUT_DIRECTORY_NAME
 
-# Default number of samples to keep after the loop end when trimming interactively: enough for players
+# Default number of samples to keep after the loop end when trimming (interactively or with the trim command): enough for players
 # that read slightly past the loop end (e.g. for resampling), while being inaudible (~2 ms at 44.1 kHz)
 RECOMMENDED_KEEP_AFTER = 100
 
@@ -248,7 +248,13 @@ class LoopExportHandler(LoopHandler):
         loop_start = chosen_loop_pair.loop_start
         loop_end = chosen_loop_pair.loop_end
 
-        if self.interactive_mode and not self.trim and self.musiclooper.supports_lossless_trim():
+        # Exporting the loop points to the console only prints them, so it does not offer to write a trimmed file
+        if (
+            self.interactive_mode
+            and not self.trim
+            and not self.to_stdout
+            and self.musiclooper.supports_lossless_trim()
+        ):
             with _hideprogressbar(self._progressbar):
                 self.trim, self.keep_after = self.trim_prompt()
 
