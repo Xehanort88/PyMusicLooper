@@ -120,11 +120,24 @@ def test_interactive_trim_prompt_declined(monkeypatch, fake_input, track, tmp_pa
 def test_interactive_trim_prompt_skipped_for_unsupported_formats(monkeypatch, fake_input, track, tmp_path):
     source_path = tmp_path / "track.mp3"
     sf.write(source_path, track, SR, format="MP3")
-    export_handler = _interactive_export_handler(monkeypatch, source_path, tmp_path / "out", to_stdout=True)
+    export_handler = _interactive_export_handler(monkeypatch, source_path, tmp_path / "out", to_txt=True)
 
     # Only the loop selection is answered; a trim prompt would exhaust the answers
     fake_input("0")
     export_handler.run()
+
+
+def test_interactive_trim_prompt_skipped_when_printing_loop_points(monkeypatch, fake_input, track, tmp_path):
+    source_path = tmp_path / "track.flac"
+    sf.write(source_path, track, SR)
+    out_dir = tmp_path / "out"
+    export_handler = _interactive_export_handler(monkeypatch, source_path, out_dir, to_stdout=True)
+
+    # Only the loop selection is answered; a trim prompt would exhaust the answers
+    fake_input("0")
+    export_handler.run()
+
+    assert not out_dir.exists()
 
 
 def test_interactive_trim_command_does_not_prompt_again(monkeypatch, fake_input, track, tmp_path):

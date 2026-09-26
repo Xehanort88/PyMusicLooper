@@ -19,7 +19,7 @@ from pymusiclooper import __version__
 from pymusiclooper.console import _COMMAND_GROUPS, _OPTION_GROUPS, rich_console
 from pymusiclooper.core import MusicLooper
 from pymusiclooper.exceptions import AudioLoadError, LoopNotFoundError
-from pymusiclooper.handler import BatchHandler, LoopExportHandler, LoopHandler
+from pymusiclooper.handler import RECOMMENDED_KEEP_AFTER, BatchHandler, LoopExportHandler, LoopHandler
 from pymusiclooper.utils import download_audio, get_outputdir, mk_outputdir
 
 # CLI --help styling
@@ -232,9 +232,9 @@ def tag(**kwargs):
 @common_path_options
 @common_loop_options
 @common_export_options
-@click.option('--keep-after', type=click.IntRange(min=0), default=0, show_default=True, help="Number of samples to keep after the loop end.")
+@click.option('--keep-after', type=click.IntRange(min=0), default=RECOMMENDED_KEEP_AFTER, show_default=True, help="Number of samples to keep after the loop end. [dim](A few samples avoid clicks in players that read slightly past the loop end, e.g. for resampling; use [cyan]0[/] to cut exactly at the loop end.)[/]")
 def trim(**kwargs):
-    """Losslessly cut the audio after the loop end, keeping its original format, bit depth and tags. [dim](WAV, FLAC and OGG Vorbis only)[/]"""
+    """Losslessly cut the audio after the loop end, keeping its original format, bit depth and metadata. [dim](WAV, FLAC and OGG Vorbis only)[/]"""
     kwargs["trim"] = True
     run_handler(**kwargs)
 

@@ -13,8 +13,13 @@ import numpy as np
 from pymusiclooper.analysis import LoopPair, find_best_loop_points
 from pymusiclooper.audio import MLAudio
 from pymusiclooper.exceptions import LoopNotFoundError
+from pymusiclooper.flac import copy_flac_metadata
 from pymusiclooper.ogg import trim_vorbis
 from pymusiclooper.playback import PlaybackHandler
+from pymusiclooper.wav import read_smpl_loop, trim_wav, write_smpl_loop
+
+# Detected loop points this close to the embedded ones (in seconds) are the same loop, so they are not listed twice
+_DUPLICATE_LOOP_TOLERANCE = 0.005
 
 # Lazy-load external libraries when they're needed
 soundfile = lazy.load("soundfile")
@@ -41,7 +46,8 @@ class MusicLooper:
         use_embedded_tags: bool = True,
     ) -> List[LoopPair]:
         """Finds the best loop points for the track, according to the parameters specified.
-        If the file already has loop points stored in its metadata tags, they are returned as the first choice.
+        If the file already has loop points stored in its metadata tags, they are returned as the first choice,
+        and detected loop points matching them (within 5ms) are left out.
 
         Args:
             min_duration_multiplier (float, optional): The minimum duration of a loop as a multiplier of track duration. Defaults to 0.35.
@@ -80,12 +86,20 @@ class MusicLooper:
             loop_pairs = []
 
         if embedded_pair is not None:
+            tolerance = self.mlaudio.seconds_to_samples(_DUPLICATE_LOOP_TOLERANCE)
+            loop_pairs = [
+                pair
+                for pair in loop_pairs
+                if abs(pair.loop_start - embedded_pair.loop_start) > tolerance
+                or abs(pair.loop_end - embedded_pair.loop_end) > tolerance
+            ]
             loop_pairs.insert(0, embedded_pair)
 
         return loop_pairs
 
     def read_embedded_loop_pair(self) -> Optional[LoopPair]:
-        """Reads the loop points stored in the file's metadata tags (e.g. LOOP_START/LOOP_END), auto-detecting the tag names.
+        """Reads the loop points stored in the file's metadata tags (e.g. LOOP_START/LOOP_END), auto-detecting the tag names,
+        or else in a WAV file's sampler (smpl) chunk.
 
         Returns:
             Optional[LoopPair]: A `LoopPair` with `from_metadata=True`, or None if the file has no valid loop tags.
@@ -315,8 +329,10 @@ class MusicLooper:
         output_dir: Optional[str] = None,
     ) -> str:
         """Losslessly cuts the audio `keep_after` samples after the loop end, removing the rest of the track.
-        The original container, bit depth and tags are kept; only WAV, FLAC and Ogg Vorbis files are supported.
-        Ogg Vorbis files are trimmed at the container level, without re-encoding the audio.
+        The original container, bit depth and metadata are kept; only WAV, FLAC and Ogg Vorbis files are supported.
+        WAV and Ogg Vorbis files are trimmed at the container level, without re-encoding the audio, and all their
+        metadata is copied (e.g. WAV sampler loops and cue points). FLAC audio is re-encoded losslessly, and all its
+        metadata except the seek table and cue sheet is copied (e.g. tags and cover art).
         Returns the path to the trimmed audio file.
 
         Args:
@@ -357,11 +373,15 @@ class MusicLooper:
                 f"Lossless trimming is only supported for PCM/float WAV, FLAC and Ogg Vorbis files; \"{self.filename}\" is {info.format} ({info.subtype})."
             )
 
+        # The pages/chunks holding the metadata are copied verbatim, so the metadata is kept as-is
         if info.format == "OGG":
-            # The pages holding the tags are copied verbatim, so the tags are kept as-is
             trim_vorbis(self.filepath, output_file_path, loop_end + keep_after)
             return
+        if info.format == "WAV":
+            trim_wav(self.filepath, output_file_path, loop_end + keep_after)
+            return
 
+        # FLAC audio frames cannot be cut, so the kept samples are re-encoded (losslessly).
         # Read the samples in their native representation so that writing them back is bit-exact
         dtype = {"FLOAT": "float32", "DOUBLE": "float64"}.get(info.subtype, "int32")
         n_frames = min(info.frames, loop_end + keep_after)
@@ -376,10 +396,16 @@ class MusicLooper:
             endian=info.endian,
         )
 
-        self._copy_tags(output_file_path)
+        try:
+            copy_flac_metadata(self.filepath, output_file_path)
+        except ValueError as e:
+            logging.warning(
+                f"Could not copy the FLAC metadata blocks of \"{self.filename}\" ({e}); copying its tags only."
+            )
+            self._copy_tags(output_file_path)
 
     def _copy_tags(self, dest_filepath: str):
-        """Attempts to copy the metadata tags of the source audio file to `dest_filepath`."""
+        """Attempts to copy the metadata tags of the source audio file to `dest_filepath`, logging a warning on failure."""
         try:
             import taglib
             original_tags = None
@@ -389,10 +415,11 @@ class MusicLooper:
             with taglib.File(dest_filepath, save_on_exit=True) as dest_file:
                 for tag in original_tags:
                     dest_file.tags[tag] = original_tags[tag]
-        except Exception:
-            # silently ignore errors for now;
-            # TODO: implement logging for debugging
-            pass
+        except Exception as e:
+            # Tag copying is best-effort: the exported audio is still valid without them
+            logging.warning(
+                f"Could not copy the metadata tags of \"{self.filename}\" to \"{os.path.basename(dest_filepath)}\": {e}"
+            )
 
     def export_txt(
         self,
@@ -496,6 +523,7 @@ class MusicLooper:
         keep_after: int = 0,
     ) -> Tuple[str]:
         """Adds metadata tags of loop points to a copy of the source audio file.
+        For WAV files, the loop points are also written to the sampler (smpl) chunk.
 
         Args:
             loop_start (int): Loop start in samples.
@@ -528,18 +556,24 @@ class MusicLooper:
             shutil.copyfile(self.mlaudio.filepath, exported_file_path)
 
         # Handle LOOPLENGTH tag
-        if self._end_tag_is_offset(loop_end_tag, is_offset):
-            loop_end = loop_end - loop_start
+        loop_end_tag_value = loop_end - loop_start if self._end_tag_is_offset(loop_end_tag, is_offset) else loop_end
 
         with taglib.File(exported_file_path, save_on_exit=True) as audio_file:
             audio_file.tags[loop_start_tag] = [str(loop_start)]
-            audio_file.tags[loop_end_tag] = [str(loop_end)]
+            audio_file.tags[loop_end_tag] = [str(loop_end_tag_value)]
 
-        return str(loop_start), str(loop_end)
+        # Game engines and samplers read the loop points of WAV files from their sampler chunk
+        # (written after the tags, so that saving the tags cannot affect it)
+        if soundfile.info(exported_file_path).format in ("WAV", "WAVEX"):
+            write_smpl_loop(exported_file_path, loop_start, loop_end, self.mlaudio.rate)
+
+        return str(loop_start), str(loop_end_tag_value)
 
 
     def read_tags(self, loop_start_tag: str, loop_end_tag: str, is_offset: Optional[bool] = None) -> Tuple[int, int]:
-        """Reads the tags provided from the file and returns the read loop points
+        """Reads the tags provided from the file and returns the read loop points.
+        If both tag names are None, they are auto-detected, and a WAV file without loop tags
+        has its loop points read from its sampler (smpl) chunk instead.
 
         Args:
             loop_start_tag (str): The name of the metadata tag containing the loop_start value
@@ -549,6 +583,15 @@ class MusicLooper:
         Returns:
             Tuple[int, int]: A tuple containing (loop_start, loop_end)
         """
+        try:
+            return self._read_loop_tags(loop_start_tag, loop_end_tag, is_offset)
+        except ValueError:
+            smpl_loop = read_smpl_loop(self.filepath) if loop_start_tag is None and loop_end_tag is None else None
+            if smpl_loop is None:
+                raise
+            return smpl_loop
+
+    def _read_loop_tags(self, loop_start_tag: str, loop_end_tag: str, is_offset: Optional[bool] = None) -> Tuple[int, int]:
         # Workaround for taglib import issues on Apple silicon devices
         # Import taglib only when needed to isolate ImportErrors
         import taglib
