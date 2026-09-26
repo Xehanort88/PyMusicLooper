@@ -16,7 +16,10 @@ from pymusiclooper.exceptions import LoopNotFoundError
 from pymusiclooper.flac import copy_flac_metadata
 from pymusiclooper.ogg import trim_vorbis
 from pymusiclooper.playback import PlaybackHandler
-from pymusiclooper.wav import trim_wav
+from pymusiclooper.wav import read_smpl_loop, trim_wav, write_smpl_loop
+
+# Detected loop points this close to the embedded ones (in seconds) are the same loop, so they are not listed twice
+_DUPLICATE_LOOP_TOLERANCE = 0.005
 
 # Lazy-load external libraries when they're needed
 soundfile = lazy.load("soundfile")
@@ -43,7 +46,8 @@ class MusicLooper:
         use_embedded_tags: bool = True,
     ) -> List[LoopPair]:
         """Finds the best loop points for the track, according to the parameters specified.
-        If the file already has loop points stored in its metadata tags, they are returned as the first choice.
+        If the file already has loop points stored in its metadata tags, they are returned as the first choice,
+        and detected loop points matching them (within 5ms) are left out.
 
         Args:
             min_duration_multiplier (float, optional): The minimum duration of a loop as a multiplier of track duration. Defaults to 0.35.
@@ -82,12 +86,20 @@ class MusicLooper:
             loop_pairs = []
 
         if embedded_pair is not None:
+            tolerance = self.mlaudio.seconds_to_samples(_DUPLICATE_LOOP_TOLERANCE)
+            loop_pairs = [
+                pair
+                for pair in loop_pairs
+                if abs(pair.loop_start - embedded_pair.loop_start) > tolerance
+                or abs(pair.loop_end - embedded_pair.loop_end) > tolerance
+            ]
             loop_pairs.insert(0, embedded_pair)
 
         return loop_pairs
 
     def read_embedded_loop_pair(self) -> Optional[LoopPair]:
-        """Reads the loop points stored in the file's metadata tags (e.g. LOOP_START/LOOP_END), auto-detecting the tag names.
+        """Reads the loop points stored in the file's metadata tags (e.g. LOOP_START/LOOP_END), auto-detecting the tag names,
+        or else in a WAV file's sampler (smpl) chunk.
 
         Returns:
             Optional[LoopPair]: A `LoopPair` with `from_metadata=True`, or None if the file has no valid loop tags.
@@ -511,6 +523,7 @@ class MusicLooper:
         keep_after: int = 0,
     ) -> Tuple[str]:
         """Adds metadata tags of loop points to a copy of the source audio file.
+        For WAV files, the loop points are also written to the sampler (smpl) chunk.
 
         Args:
             loop_start (int): Loop start in samples.
@@ -543,18 +556,24 @@ class MusicLooper:
             shutil.copyfile(self.mlaudio.filepath, exported_file_path)
 
         # Handle LOOPLENGTH tag
-        if self._end_tag_is_offset(loop_end_tag, is_offset):
-            loop_end = loop_end - loop_start
+        loop_end_tag_value = loop_end - loop_start if self._end_tag_is_offset(loop_end_tag, is_offset) else loop_end
 
         with taglib.File(exported_file_path, save_on_exit=True) as audio_file:
             audio_file.tags[loop_start_tag] = [str(loop_start)]
-            audio_file.tags[loop_end_tag] = [str(loop_end)]
+            audio_file.tags[loop_end_tag] = [str(loop_end_tag_value)]
 
-        return str(loop_start), str(loop_end)
+        # Game engines and samplers read the loop points of WAV files from their sampler chunk
+        # (written after the tags, so that saving the tags cannot affect it)
+        if soundfile.info(exported_file_path).format in ("WAV", "WAVEX"):
+            write_smpl_loop(exported_file_path, loop_start, loop_end, self.mlaudio.rate)
+
+        return str(loop_start), str(loop_end_tag_value)
 
 
     def read_tags(self, loop_start_tag: str, loop_end_tag: str, is_offset: Optional[bool] = None) -> Tuple[int, int]:
-        """Reads the tags provided from the file and returns the read loop points
+        """Reads the tags provided from the file and returns the read loop points.
+        If both tag names are None, they are auto-detected, and a WAV file without loop tags
+        has its loop points read from its sampler (smpl) chunk instead.
 
         Args:
             loop_start_tag (str): The name of the metadata tag containing the loop_start value
@@ -564,6 +583,15 @@ class MusicLooper:
         Returns:
             Tuple[int, int]: A tuple containing (loop_start, loop_end)
         """
+        try:
+            return self._read_loop_tags(loop_start_tag, loop_end_tag, is_offset)
+        except ValueError:
+            smpl_loop = read_smpl_loop(self.filepath) if loop_start_tag is None and loop_end_tag is None else None
+            if smpl_loop is None:
+                raise
+            return smpl_loop
+
+    def _read_loop_tags(self, loop_start_tag: str, loop_end_tag: str, is_offset: Optional[bool] = None) -> Tuple[int, int]:
         # Workaround for taglib import issues on Apple silicon devices
         # Import taglib only when needed to isolate ImportErrors
         import taglib
