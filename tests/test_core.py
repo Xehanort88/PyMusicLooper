@@ -1,4 +1,6 @@
 import os
+import struct
+from pathlib import Path
 
 import numpy as np
 import pytest
@@ -207,6 +209,163 @@ def test_trim_copies_source_tags(flac_track_path, tmp_path):
     assert MusicLooper(output_path).read_tags(None, None) == (LOOP_START, LOOP_END)
 
 
+def _append_wav_chunk(path, chunk_id: bytes, chunk_data: bytes):
+    data = path.read_bytes() + chunk_id + struct.pack("<I", len(chunk_data)) + chunk_data + b"\x00" * (len(chunk_data) & 1)
+    path.write_bytes(data[:4] + struct.pack("<I", len(data) - 8) + data[8:])
+
+
+def _wav_chunks(path) -> dict:
+    from pymusiclooper.wav import _read_chunks
+
+    return {chunk.chunk_id: chunk.data for chunk in _read_chunks(path.read_bytes(), "<")}
+
+
+@pytest.mark.parametrize(
+    ("subtype", "keep_after"),
+    [
+        ("PCM_16", 100),
+        # 8-bit mono with an odd number of frames: the data chunk needs a pad byte
+        ("PCM_U8", 1),
+        # Float WAV files have a fact chunk holding the number of frames
+        ("FLOAT", 0),
+    ],
+)
+def test_trim_wav_keeps_all_chunks(track, tmp_path, subtype, keep_after):
+    source_path = tmp_path / "track.wav"
+    sf.write(source_path, track, SR, subtype=subtype)
+    with taglib.File(str(source_path), save_on_exit=True) as source:
+        source.tags["TITLE"] = ["Loop"]
+    sampler_chunk = bytes(range(60))
+    odd_chunk = b"odd"
+    _append_wav_chunk(source_path, b"smpl", sampler_chunk)
+    _append_wav_chunk(source_path, b"xodd", odd_chunk)
+    out_dir = tmp_path / "out"
+    out_dir.mkdir()
+
+    output_path = MusicLooper(str(source_path)).trim(LOOP_END, keep_after=keep_after, output_dir=str(out_dir))
+
+    n_frames = LOOP_END + keep_after
+    source_chunks = _wav_chunks(source_path)
+    trimmed_chunks = _wav_chunks(tmp_path / "out" / "track-trimmed.wav")
+    assert list(trimmed_chunks) == list(source_chunks)
+    for chunk_id in source_chunks:
+        if chunk_id not in (b"data", b"fact"):
+            assert trimmed_chunks[chunk_id] == source_chunks[chunk_id]
+    assert trimmed_chunks[b"smpl"] == sampler_chunk
+    assert trimmed_chunks[b"xodd"] == odd_chunk
+    if b"fact" in source_chunks:
+        assert struct.unpack_from("<I", trimmed_chunks[b"fact"])[0] == n_frames
+
+    source, _ = sf.read(source_path, dtype="float32")
+    trimmed, _ = sf.read(output_path, dtype="float32")
+    assert sf.info(output_path).frames == n_frames
+    np.testing.assert_array_equal(trimmed, source[:n_frames])
+    with taglib.File(output_path) as trimmed_file:
+        assert trimmed_file.tags["TITLE"] == ["Loop"]
+
+
+@pytest.mark.parametrize("placeholder_size", [0, 0xFFFFFFFF])
+def test_trim_wav_with_placeholder_data_size(track, tmp_path, placeholder_size):
+    from pymusiclooper.wav import trim_wav
+
+    source_path = tmp_path / "track.wav"
+    sf.write(source_path, track, SR, subtype="PCM_16")
+    source, _ = sf.read(source_path, dtype="int16")
+    # Size left unset by an interrupted or streaming writer
+    data = source_path.read_bytes()
+    size_offset = data.index(b"data") + 4
+    source_path.write_bytes(data[:size_offset] + struct.pack("<I", placeholder_size) + data[size_offset + 4:])
+    output_path = tmp_path / "trimmed.wav"
+
+    assert trim_wav(str(source_path), str(output_path), LOOP_END) == LOOP_END
+
+    trimmed, _ = sf.read(output_path, dtype="int16")
+    np.testing.assert_array_equal(trimmed, source[:LOOP_END])
+
+
+def test_trim_wav_keep_after_past_track_end_keeps_whole_track(track_path, track, tmp_path):
+    output_path = MusicLooper(track_path).trim(LOOP_END, keep_after=10 * track.size, output_dir=str(tmp_path))
+
+    assert open(output_path, "rb").read() == open(track_path, "rb").read()
+
+
+def _flac_with_metadata_blocks(path, extra_blocks, prefix=b"", suffix=b""):
+    """Rewrites a FLAC file with extra metadata blocks, and optional data around it (e.g. ID3 tags)."""
+    from pymusiclooper.flac import _read_metadata
+
+    data = path.read_bytes()
+    _, blocks, audio_offset = _read_metadata(data)
+    blocks = blocks[:1] + extra_blocks + blocks[1:]
+    output = [prefix, b"fLaC"]
+    for idx, (block_type, block_data) in enumerate(blocks):
+        output += [bytes([(0x80 if idx == len(blocks) - 1 else 0) | block_type]), len(block_data).to_bytes(3, "big"), block_data]
+    path.write_bytes(b"".join(output) + data[audio_offset:] + suffix)
+
+
+def test_trim_flac_keeps_metadata_blocks(flac_track_path, tmp_path):
+    from pymusiclooper.flac import _read_metadata
+
+    source_path = Path(flac_track_path)
+    with taglib.File(flac_track_path, save_on_exit=True) as source:
+        source.tags["TITLE"] = ["Loop"]
+    # Front cover: picture type, MIME type, description, width, height, color depth, palette size, picture data
+    mime_type, description, picture = b"image/png", b"cover", b"not really a png" * 20
+    picture_block = (6, struct.pack(
+        f">II{len(mime_type)}sI{len(description)}sIIIII{len(picture)}s",
+        3, len(mime_type), mime_type, len(description), description, 16, 16, 24, 0, len(picture), picture,
+    ))
+    application_block = (2, b"TEST" + bytes(range(40)))
+    # A seek table with a single placeholder point, which does not apply to the trimmed audio
+    seektable_block = (3, b"\xff" * 8 + b"\x00" * 10)
+    id3v2 = b"ID3\x03\x00\x00\x00\x00\x00\x14" + b"\x00" * 20
+    id3v1 = b"TAG" + b"\x00" * 125
+    _flac_with_metadata_blocks(source_path, [seektable_block, picture_block, application_block], id3v2, id3v1)
+    out_dir = tmp_path / "out"
+    out_dir.mkdir()
+
+    output_path = MusicLooper(str(source_path)).trim(LOOP_END, keep_after=100, output_dir=str(out_dir))
+
+    trimmed_data = open(output_path, "rb").read()
+    _, source_blocks, _ = _read_metadata(source_path.read_bytes())
+    _, trimmed_blocks, _ = _read_metadata(trimmed_data)
+    assert trimmed_blocks[0][0] == 0
+    assert trimmed_blocks[1:] == [block for block in source_blocks if block[0] not in (0, 3)]
+    assert picture_block in trimmed_blocks and application_block in trimmed_blocks
+    assert trimmed_data.startswith(id3v2) and trimmed_data.endswith(id3v1)
+
+    source, _ = sf.read(source_path, dtype="int32")
+    trimmed, _ = sf.read(output_path, dtype="int32")
+    assert sf.info(output_path).frames == LOOP_END + 100
+    np.testing.assert_array_equal(trimmed, source[: LOOP_END + 100])
+    with taglib.File(output_path) as trimmed_file:
+        assert trimmed_file.tags["TITLE"] == ["Loop"]
+
+
+def test_trim_flac_falls_back_to_copying_tags(flac_track_path, tmp_path, monkeypatch, caplog):
+    from pymusiclooper import core
+
+    def fail(*args, **kwargs):
+        raise ValueError("unparseable")
+
+    monkeypatch.setattr(core, "copy_flac_metadata", fail)
+    with taglib.File(flac_track_path, save_on_exit=True) as source:
+        source.tags["TITLE"] = ["Loop"]
+    out_dir = tmp_path / "out"
+    out_dir.mkdir()
+
+    output_path = MusicLooper(flac_track_path).trim(LOOP_END, output_dir=str(out_dir))
+
+    assert "copying its tags only" in caplog.text
+    with taglib.File(output_path) as trimmed_file:
+        assert trimmed_file.tags["TITLE"] == ["Loop"]
+
+
+def test_copy_tags_failure_is_logged(looper, tmp_path, caplog):
+    looper._copy_tags(str(tmp_path / "missing.wav"))
+
+    assert "Could not copy the metadata tags" in caplog.text
+
+
 @pytest.mark.parametrize("keep_after", [0, 777])
 def test_trim_ogg_vorbis_without_reencoding(track, tmp_path, keep_after):
     source_path = tmp_path / "track.ogg"
@@ -327,3 +486,66 @@ def test_trim_ogg_vorbis_falls_back_to_page_level_cut(track, tmp_path, monkeypat
     source, _ = sf.read(source_path, dtype="float32")
     trimmed, _ = sf.read(output_path, dtype="float32")
     np.testing.assert_array_equal(trimmed, source[:LOOP_END])
+
+
+def _ogg_with_start_granule(source_path, output_path, start_granule: int):
+    """Writes a copy of an Ogg Vorbis file whose samples are numbered from `start_granule` instead of 0,
+    like a stream recorded from the middle of a longer one."""
+    from pymusiclooper.ogg import _build_page, _read_pages
+
+    output_path.write_bytes(b"".join(
+        _build_page(
+            page,
+            page.header_type,
+            page.granule_position + start_granule if page.granule_position > 0 else page.granule_position,
+            page.segment_table,
+            page.body,
+        )
+        for page in _read_pages(source_path.read_bytes())
+    ))
+
+
+@pytest.mark.parametrize("keep_after", [0, 777])
+def test_trim_ogg_vorbis_with_start_granule(track, tmp_path, keep_after):
+    from pymusiclooper.ogg import _find_packet_cut, _read_pages, _start_granule
+
+    start_granule = 44100
+    plain_path = tmp_path / "plain.ogg"
+    sf.write(plain_path, np.stack([track, 0.8 * track], axis=1), SR, format="OGG", subtype="VORBIS")
+    source_path = tmp_path / "track.ogg"
+    _ogg_with_start_granule(plain_path, source_path, start_granule)
+    out_dir = tmp_path / "out"
+    out_dir.mkdir()
+
+    pages = list(_read_pages(source_path.read_bytes()))
+    assert _start_granule(pages) == start_granule
+    # Raises if the computed packet durations do not add up to the page granule positions
+    assert _find_packet_cut(pages, start_granule + LOOP_END, start_granule) is not None
+
+    output_path = MusicLooper(str(source_path)).trim(LOOP_END, keep_after=keep_after, output_dir=str(out_dir))
+
+    source, _ = sf.read(source_path, dtype="float32")
+    trimmed, _ = sf.read(output_path, dtype="float32")
+    assert source.shape[0] == track.size
+    np.testing.assert_array_equal(trimmed, source[: LOOP_END + keep_after])
+    assert list(_read_pages(open(output_path, "rb").read()))[-1].granule_position == start_granule + LOOP_END + keep_after
+
+
+def test_trim_ogg_vorbis_with_start_granule_past_track_end(track, tmp_path):
+    from pymusiclooper.ogg import trim_vorbis
+
+    plain_path = tmp_path / "plain.ogg"
+    sf.write(plain_path, track, SR, format="OGG", subtype="VORBIS")
+    source_path = tmp_path / "track.ogg"
+    _ogg_with_start_granule(plain_path, source_path, 44100)
+
+    assert trim_vorbis(str(source_path), str(tmp_path / "trimmed.ogg"), 10 * track.size) == track.size
+
+
+def test_ogg_vorbis_start_granule_is_zero_for_regular_files(track, tmp_path):
+    from pymusiclooper.ogg import _read_pages, _start_granule
+
+    source_path = tmp_path / "track.ogg"
+    sf.write(source_path, track, SR, format="OGG", subtype="VORBIS")
+
+    assert _start_granule(list(_read_pages(source_path.read_bytes()))) == 0

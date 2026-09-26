@@ -234,7 +234,7 @@ def tag(**kwargs):
 @common_export_options
 @click.option('--keep-after', type=click.IntRange(min=0), default=0, show_default=True, help="Number of samples to keep after the loop end.")
 def trim(**kwargs):
-    """Losslessly cut the audio after the loop end, keeping its original format, bit depth and tags. [dim](WAV, FLAC and OGG Vorbis only)[/]"""
+    """Losslessly cut the audio after the loop end, keeping its original format, bit depth and metadata. [dim](WAV, FLAC and OGG Vorbis only)[/]"""
     kwargs["trim"] = True
     run_handler(**kwargs)
 
