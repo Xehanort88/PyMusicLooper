@@ -3,6 +3,7 @@ import os
 import pytest
 import soundfile as sf
 from conftest import SR
+from rich.text import Text
 
 from pymusiclooper import handler
 from pymusiclooper.analysis import LoopPair
@@ -174,6 +175,86 @@ def test_txt_export_message_names_written_file(monkeypatch, track_path, tmp_path
     written = os.listdir(tmp_path)
     assert written == ["loops.txt"]
     assert str(tmp_path / "loops.txt") in messages[0]
+
+
+def _write_loop_tags(path, loop_start, loop_end):
+    import taglib
+    with taglib.File(str(path), save_on_exit=True) as audio_file:
+        audio_file.tags["LOOP_START"] = [str(loop_start)]
+        audio_file.tags["LOOP_END"] = [str(loop_end)]
+
+
+@pytest.fixture
+def batch_dir(tmp_path, track):
+    """A directory with a tagged track, an untagged track, a track with tags past its end, and a non-audio file."""
+    in_dir = tmp_path / "in"
+    in_dir.mkdir()
+    for name in ("tagged.flac", "untagged.flac", "bad_tags.flac"):
+        sf.write(in_dir / name, track, SR)
+    _write_loop_tags(in_dir / "tagged.flac", 1000, 50000)
+    _write_loop_tags(in_dir / "bad_tags.flac", 1000, track.size + 1)
+    (in_dir / "notes.txt").write_text("not audio")
+    return in_dir
+
+
+def _run_batch(monkeypatch, in_dir, out_dir, **kwargs):
+    printed = []
+
+    def capture(*args, markup=True, **kw):
+        text = " ".join(map(str, args))
+        printed.append(Text.from_markup(text).plain if markup else text)
+    monkeypatch.setattr(handler.rich_console, "print", capture)
+    batch_handler = BatchHandler(path=str(in_dir), output_dir=str(out_dir), min_duration_multiplier=0.35, **kwargs)
+    results = batch_handler.run()
+    return {os.path.basename(result.path): result for result in results}, "\n".join(printed)
+
+
+def test_batch_tags_only_skips_files_without_valid_tags(monkeypatch, batch_dir, tmp_path):
+    out_dir = tmp_path / "out"
+    results, summary = _run_batch(monkeypatch, batch_dir, out_dir, tags_only=True, trim=True)
+
+    assert {name: result.outcome for name, result in results.items()} == {
+        "tagged.flac": "tags",
+        "untagged.flac": "skipped",
+        "bad_tags.flac": "skipped",
+        "notes.txt": "not_audio",
+    }
+    assert os.listdir(out_dir) == ["tagged-trimmed.flac"]
+    assert sf.info(out_dir / "tagged-trimmed.flac").frames == 50000
+
+    summary_lines = [line.strip() for line in summary.splitlines()]
+    assert "Processed: 1 (1 with the loop points from their tags, 0 with detected loop points)" in summary_lines
+    assert "Skipped: 2" in summary_lines
+    # Skipped files are grouped by reason
+    assert summary_lines.index("Missing loop tags (1):") + 1 == summary_lines.index("untagged.flac")
+    bad_tags_idx = summary_lines.index("Loop tags do not fit in the audio (1):") + 1
+    assert summary_lines[bad_tags_idx].startswith("bad_tags.flac: 00:00.045 -> ")
+    assert "Not audio files: 1 (.txt: 1)" in summary_lines
+    assert "Failed" not in summary
+
+
+def test_batch_counts_tagged_and_detected_loop_points(monkeypatch, batch_dir, tmp_path):
+    results, summary = _run_batch(monkeypatch, batch_dir, tmp_path / "out", to_txt=True)
+
+    assert results["tagged.flac"].outcome == "tags"
+    # Without --tags-only, files without valid loop tags fall back to the detected loop points
+    assert results["untagged.flac"].outcome == "detected"
+    assert results["bad_tags.flac"].outcome == "detected"
+    assert results["notes.txt"].outcome == "not_audio"
+    assert "Processed: 3 (1 with the loop points from their tags, 2 with detected loop points)" in summary
+
+
+def test_batch_reports_failed_exports(monkeypatch, tmp_path, track):
+    in_dir = tmp_path / "in"
+    in_dir.mkdir()
+    sf.write(in_dir / "lossy.mp3", track, SR, format="MP3")
+
+    results, summary = _run_batch(monkeypatch, in_dir, tmp_path / "out", trim=True)
+
+    assert results["lossy.mp3"].outcome == "failed"
+    assert "Lossless trimming is only supported" in results["lossy.mp3"].messages[0]
+    assert "Failed: 1" in summary
+    assert "- lossy.mp3: Lossless trimming is only supported" in summary
 
 
 def test_get_files_in_directory(tmp_path):

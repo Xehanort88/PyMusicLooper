@@ -119,11 +119,11 @@ pymusiclooper -i play --url "https://www.youtube.com/watch?v=dQw4w9WgXcQ"
 pymusiclooper play-tagged --path "TRACK_NAME.mp3" --tag-names LOOP_START LOOP_END
 ```
 
-*Note: if a file already has loop metadata tags (e.g. LOOP_START/LOOP_END or LOOPSTART/LOOPLENGTH), or is a WAV file with a loop in its sampler (`smpl`) chunk, those loop points are used as the first loop choice by all commands. Use `--ignore-tags` to skip them.*
+*Note: if a file already has loop metadata tags (e.g. LOOP_START/LOOP_END or LOOPSTART/LOOPLENGTH), or is a WAV file with a loop in its sampler (`smpl`) chunk, those loop points are used as the first loop choice by all commands. Use `--ignore-tags` to skip them, or `--tags-only` to use only them and skip the (slower) loop analysis; with `--tags-only`, files without valid loop tags are skipped.*
 
 ### Export
 
-*Note: batch processing is available for all export subcommands. Simply specify a directory instead of a file as the path to be used.*
+*Note: batch processing is available for all export subcommands. Simply specify a directory instead of a file as the path to be used. A summary at the end lists how many files were processed (with loop points from their tags or detected ones), and which were skipped or failed and why.*
 
 ```sh
 # Split the audio track into intro, loop and outro files.
@@ -164,6 +164,10 @@ pymusiclooper -i tag --path "TRACK_NAME.ogg" --tag-names LOOPSTART LOOPLENGTH
 # (compatible with https://github.com/libertyernie/LoopingAudioConverter/)
 # Note: each line in loop.txt follows the following format: {loop-start} {loop-end} {filename}
 pymusiclooper -i export-points --path "/path/to/dir/" --export-to txt
+
+# Trim all the tracks of a directory that already have loop tags, using only their tags (no loop analysis);
+# tracks without valid loop tags are skipped and listed in the summary at the end
+pymusiclooper trim --path "/path/to/dir/" --tags-only --output-dir "/path/to/trimmed/"
 ```
 
 ### Miscellaneous

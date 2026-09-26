@@ -44,6 +44,7 @@ class MusicLooper:
         brute_force: bool = False,
         disable_pruning: bool = False,
         use_embedded_tags: bool = True,
+        tags_only: bool = False,
     ) -> List[LoopPair]:
         """Finds the best loop points for the track, according to the parameters specified.
         If the file already has loop points stored in its metadata tags, they are returned as the first choice,
@@ -58,13 +59,17 @@ class MusicLooper:
             brute_force (bool, optional): Checks the entire track instead of the detected beats (disclaimer: runtime may be significantly longer). Defaults to False.
             disable_pruning (bool, optional): Returns all the candidate loop points without filtering. Defaults to False.
             use_embedded_tags (bool, optional): Places the loop points found in the file's metadata tags (if any) first in the returned list. Ignored if an approximate loop position is specified. Defaults to True.
+            tags_only (bool, optional): Returns only the loop points found in the file's metadata tags, without analyzing the audio (the other parameters are then ignored). Defaults to False.
 
         Raises:
-            LoopNotFoundError: raised in case no loops were found
+            LoopNotFoundError: raised in case no loops were found, or with `tags_only`, if the file has no valid loop tags
 
         Returns:
             List[LoopPair]: A list of `LoopPair` objects containing the loop points related data. See the `LoopPair` class for more info.
         """
+        if tags_only:
+            return [self.read_embedded_loop_pair(required=True)]
+
         embedded_pair = None
         if use_embedded_tags and approx_loop_start is None and approx_loop_end is None:
             embedded_pair = self.read_embedded_loop_pair()
@@ -97,9 +102,13 @@ class MusicLooper:
 
         return loop_pairs
 
-    def read_embedded_loop_pair(self) -> Optional[LoopPair]:
+    def read_embedded_loop_pair(self, required: bool = False) -> Optional[LoopPair]:
         """Reads the loop points stored in the file's metadata tags (e.g. LOOP_START/LOOP_END), auto-detecting the tag names,
         or else in a WAV file's sampler (smpl) chunk.
+
+        Args:
+            required (bool, optional): Raise a `LoopNotFoundError` explaining why, instead of returning None,
+            if the file has no valid loop tags. Defaults to False.
 
         Returns:
             Optional[LoopPair]: A `LoopPair` with `from_metadata=True`, or None if the file has no valid loop tags.
@@ -107,14 +116,26 @@ class MusicLooper:
         try:
             loop_start, loop_end = self.read_tags(None, None)
         except Exception as e:
+            if required:
+                # read_tags raises a ValueError for missing tags, and a TypeError for non-integer values
+                reason = {ValueError: "missing loop tags", TypeError: "invalid loop tag values"}.get(
+                    type(e), "loop tags could not be read"
+                )
+                # The errors of read_tags already name the file
+                raise LoopNotFoundError(str(e), reason=reason) from e
             logging.debug(f"No embedded loop points read from \"{self.filename}\": {e}")
             return None
 
         if not 0 <= loop_start < loop_end <= self.mlaudio.length:
-            logging.warning(
-                f"Ignoring embedded loop points of \"{self.filename}\" ({loop_start}, {loop_end}):"
-                f" outside the audio's range of {self.mlaudio.length} samples."
+            detail = (
+                f"{self.samples_to_ftime(loop_start)} -> {self.samples_to_ftime(loop_end)}"
+                f" ({loop_start} -> {loop_end} samples); the audio is {self.samples_to_ftime(self.mlaudio.length)}"
+                f" ({self.mlaudio.length} samples) long"
             )
+            message = f"The embedded loop points of \"{self.filename}\" do not fit in the audio: {detail}."
+            if required:
+                raise LoopNotFoundError(message, reason="loop tags do not fit in the audio", detail=detail)
+            logging.warning(f"{message} Ignoring them.")
             return None
 
         logging.info(f"Found embedded loop points in the metadata tags: {loop_start} -> {loop_end}")
@@ -613,7 +634,7 @@ class MusicLooper:
                 loop_end = int(audio_file.tags[loop_end_tag][0])
             except Exception as e:
                 raise TypeError(
-                    "One of the tags provided has invalid (non-integer or empty) values"
+                    f"One of the loop tags of \"{self.filename}\" has an invalid (non-integer or empty) value."
                 ) from e
 
         # Re-order the loop points in case

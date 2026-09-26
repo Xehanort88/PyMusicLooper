@@ -3,7 +3,7 @@ import os
 import librosa
 import numpy as np
 
-from pymusiclooper.exceptions import AudioLoadError
+from pymusiclooper.exceptions import AudioLoadError, NotAudioError
 
 
 class MLAudio:
@@ -32,7 +32,7 @@ class MLAudio:
         try:
             raw_audio, sampling_rate = librosa.load(filepath, sr=None, mono=False)
         except Exception as e:
-            raise AudioLoadError(f"{os.path.basename(filepath)} could not be loaded. It might not contain valid audio data, or is in an supported format.") from e
+            raise NotAudioError(f"{os.path.basename(filepath)} could not be loaded. It might not contain valid audio data, or is in an supported format.") from e
 
         self.total_duration = librosa.get_duration(y=raw_audio, sr=sampling_rate)
 

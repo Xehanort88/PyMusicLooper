@@ -78,9 +78,14 @@ def common_loop_options(f):
     @click.option("--brute-force", is_flag=True, default=False, help=r"Check the entire audio track instead of just the detected beats. [dim yellow](Warning: may take several minutes to complete.)[/]")
     @click.option("--disable-pruning", is_flag=True, default=False, help="Disables filtering of the detected loop points from the initial pass.")
     @click.option("--ignore-tags", is_flag=True, default=False, help="Ignore loop points already stored in the file's metadata tags (e.g. LOOP_START/LOOP_END), which are otherwise used as the first choice.")
+    @click.option("--tags-only", is_flag=True, default=False, help="Only use the loop points stored in the file's metadata tags, skipping the loop analysis; files without valid loop tags are skipped. [dim](Much faster for files that are already tagged.)[/]")
 
     @functools.wraps(f)
     def wrapper_common_options(*args, **kwargs):
+        if kwargs.get("tags_only") and kwargs.get("ignore_tags"):
+            raise click.UsageError("--tags-only and --ignore-tags cannot be used together.")
+        if kwargs.get("tags_only") and kwargs.get("approx_loop_position"):
+            raise click.UsageError("--tags-only and --approx-loop-position cannot be used together.")
         return f(*args, **kwargs)
 
     return wrapper_common_options

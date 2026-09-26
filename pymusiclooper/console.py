@@ -13,6 +13,7 @@ _loop_options = [
     "--brute-force",
     "--disable-pruning",
     "--ignore-tags",
+    "--tags-only",
 ]
 _export_options = ["--output-dir", "--format"]
 _batch_options = ["--recursive", "--flatten"]
