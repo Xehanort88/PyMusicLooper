@@ -2,7 +2,8 @@
 
 The Ogg pages up to the requested length are copied verbatim. On the last kept page, the audio packets after the
 one containing the requested end sample are dropped, then its granule position (the number of samples decoded by
-the end of a page) is lowered to the requested length and the page is marked as the end of the stream.
+the end of a page, counted from the stream's start granule) is lowered to the requested length and the page is marked
+as the end of the stream.
 The Vorbis specification defines this as the way to end a stream on a sample that is not on a block boundary:
 decoders must discard the samples past it. Keeping the trimmed samples within the last packet matches what encoders
 produce, which is required by decoders that only trim the last packet (e.g. FFmpeg).
@@ -158,17 +159,13 @@ class _VorbisPacketDuration:
         return 0 if is_first_packet else (previous_blocksize + current_blocksize) // 4
 
 
-def _find_packet_cut(pages: List[_Page], n_samples: int) -> Optional[Tuple[int, int]]:
-    """Finds where to cut the stream so that the last kept packet contains sample `n_samples`.
-
-    Returns:
-        Optional[Tuple[int, int]]: (index of the last page to keep, number of its segments to keep),
-        or None if the requested length is at or past the end of the stream.
+def _completed_audio_packets(pages: List[_Page]) -> Iterator[Tuple[int, List[Tuple[int, int]]]]:
+    """Yields, for each page on which audio packets end, its index and the
+    (duration, number of segments up to the packet's end) of each audio packet completed on it.
     """
     header_packets = []
     packet_duration = None
     packet_data = b""
-    previous_granule = 0
 
     for page_idx, page in enumerate(pages):
         # (duration, number of segments up to the packet's end) of each packet completed on this page
@@ -190,10 +187,40 @@ def _find_packet_cut(pages: List[_Page], n_samples: int) -> Optional[Tuple[int, 
         if len(header_packets) == 3 and len(packet_data) > 1:
             packet_data = packet_data[:1]
 
-        if not completed_packets or page.granule_position == -1:
-            continue
+        if completed_packets and page.granule_position != -1:
+            yield page_idx, completed_packets
 
-        if page.granule_position >= n_samples:
+
+def _start_granule(pages: List[_Page]) -> int:
+    """Returns the granule position of the stream's first sample.
+
+    It is usually 0, but a stream cut out of a longer one (e.g. recorded from a live stream) can start later:
+    decoders then take the granule position of the first audio page minus the samples decoded from it as the start,
+    and number the decoded samples from there. A lower granule position on the first audio page instead means that
+    the stream also ends on it, before the end of its last packet.
+    """
+    for page_idx, completed_packets in _completed_audio_packets(pages):
+        return max(0, pages[page_idx].granule_position - sum(duration for duration, _ in completed_packets))
+    return 0
+
+
+def _find_packet_cut(pages: List[_Page], end_granule: int, start_granule: int = 0) -> Optional[Tuple[int, int]]:
+    """Finds where to cut the stream so that the last kept packet contains the sample at granule position `end_granule`.
+
+    Args:
+        pages (List[_Page]): The pages of the stream.
+        end_granule (int): Granule position of the requested end.
+        start_granule (int, optional): Granule position of the stream's first sample (see `_start_granule`). Defaults to 0.
+
+    Returns:
+        Optional[Tuple[int, int]]: (index of the last page to keep, number of its segments to keep),
+        or None if the requested length is at or past the end of the stream.
+    """
+    previous_granule = start_granule
+
+    for page_idx, completed_packets in _completed_audio_packets(pages):
+        page = pages[page_idx]
+        if page.granule_position >= end_granule:
             page_end = previous_granule + sum(duration for duration, _ in completed_packets)
             # The final page of a stream may already end it before the end of its last packet
             is_final_page = page.header_type & _END_OF_STREAM_FLAG or page_idx == len(pages) - 1
@@ -202,7 +229,7 @@ def _find_packet_cut(pages: List[_Page], n_samples: int) -> Optional[Tuple[int, 
             packet_end = previous_granule
             for duration, n_segments in completed_packets:
                 packet_end += duration
-                if packet_end >= n_samples:
+                if packet_end >= end_granule:
                     return page_idx, n_segments
 
         previous_granule = page.granule_position
@@ -210,12 +237,12 @@ def _find_packet_cut(pages: List[_Page], n_samples: int) -> Optional[Tuple[int, 
     return None
 
 
-def _find_page_cut(pages: List[_Page], n_samples: int) -> Optional[Tuple[int, int]]:
+def _find_page_cut(pages: List[_Page], end_granule: int) -> Optional[Tuple[int, int]]:
     """Same as `_find_packet_cut`, but keeps all the packets completed on the last page."""
     # The first page whose completed packets reach the requested length
     # (header pages have a granule position of 0, and -1 means no packet ends on the page)
     for page_idx, page in enumerate(pages):
-        if page.granule_position >= n_samples:
+        if page.granule_position >= end_granule:
             # Drop the segments of a trailing packet that continues on the next page (a run of 255 lacing values),
             # since that packet would be incomplete. At least one packet ends on this page (granule position != -1),
             # so the run belongs entirely to a packet that starts on this page.
@@ -256,19 +283,22 @@ def trim_vorbis(src_filepath: str, dest_filepath: str, n_samples: int) -> int:
     if any(page.serial_number != pages[0].serial_number for page in pages):
         raise ValueError("Chained or multiplexed Ogg files are not supported.")
 
+    # Sample positions are counted from the stream's first sample, granule positions from its start granule
+    start_granule = 0
     try:
-        cut = _find_packet_cut(pages, max(1, n_samples))
+        start_granule = _start_granule(pages)
+        cut = _find_packet_cut(pages, start_granule + max(1, n_samples), start_granule)
     except (ValueError, IndexError) as e:
         # Fall back to keeping all the packets of the last page, which is valid but
         # relies on decoders trimming more than the last packet
         logging.warning(f"Could not determine the Vorbis packet durations ({e}); trimming at the page level.")
-        cut = _find_page_cut(pages, max(1, n_samples))
+        cut = _find_page_cut(pages, start_granule + max(1, n_samples))
 
     if cut is None:
         # Requested length is at or past the end of the stream: keep everything
         with open(dest_filepath, "wb") as f:
             f.write(data)
-        return max(0, pages[-1].granule_position)
+        return max(0, pages[-1].granule_position - start_granule)
 
     page_idx, n_segments = cut
     page = pages[page_idx]
@@ -278,7 +308,7 @@ def trim_vorbis(src_filepath: str, dest_filepath: str, n_samples: int) -> int:
     last_page = _build_page(
         page,
         header_type=page.header_type | _END_OF_STREAM_FLAG,
-        granule_position=n_samples,
+        granule_position=start_granule + n_samples,
         segment_table=segment_table,
         body=body,
     )

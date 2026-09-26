@@ -148,7 +148,9 @@ pymusiclooper export-points --path "/path/to/track.wav" --alt-export-top -1
 pymusiclooper -i tag --path "TRACK_NAME.mp3" --tag-names LOOP_START LOOP_END
 
 # Losslessly cut everything after the loop end (WAV, FLAC and OGG Vorbis only), keeping 1000 samples past it
-# The original format, bit depth and tags are preserved; OGG files are cut without re-encoding
+# The original format, bit depth and metadata are preserved; WAV and OGG files are cut without re-encoding.
+# WAV and OGG files keep all their metadata (e.g. tags, WAV sampler loops and cue points);
+# FLAC files keep all theirs (e.g. tags and cover art) except the seek table and cue sheet, which no longer apply
 pymusiclooper -i trim --path "TRACK_NAME.wav" --keep-after 1000
 
 # In interactive mode, the other export subcommands also offer to trim WAV, FLAC and OGG Vorbis files

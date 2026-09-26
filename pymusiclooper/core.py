@@ -13,8 +13,10 @@ import numpy as np
 from pymusiclooper.analysis import LoopPair, find_best_loop_points
 from pymusiclooper.audio import MLAudio
 from pymusiclooper.exceptions import LoopNotFoundError
+from pymusiclooper.flac import copy_flac_metadata
 from pymusiclooper.ogg import trim_vorbis
 from pymusiclooper.playback import PlaybackHandler
+from pymusiclooper.wav import trim_wav
 
 # Lazy-load external libraries when they're needed
 soundfile = lazy.load("soundfile")
@@ -315,8 +317,10 @@ class MusicLooper:
         output_dir: Optional[str] = None,
     ) -> str:
         """Losslessly cuts the audio `keep_after` samples after the loop end, removing the rest of the track.
-        The original container, bit depth and tags are kept; only WAV, FLAC and Ogg Vorbis files are supported.
-        Ogg Vorbis files are trimmed at the container level, without re-encoding the audio.
+        The original container, bit depth and metadata are kept; only WAV, FLAC and Ogg Vorbis files are supported.
+        WAV and Ogg Vorbis files are trimmed at the container level, without re-encoding the audio, and all their
+        metadata is copied (e.g. WAV sampler loops and cue points). FLAC audio is re-encoded losslessly, and all its
+        metadata except the seek table and cue sheet is copied (e.g. tags and cover art).
         Returns the path to the trimmed audio file.
 
         Args:
@@ -357,11 +361,15 @@ class MusicLooper:
                 f"Lossless trimming is only supported for PCM/float WAV, FLAC and Ogg Vorbis files; \"{self.filename}\" is {info.format} ({info.subtype})."
             )
 
+        # The pages/chunks holding the metadata are copied verbatim, so the metadata is kept as-is
         if info.format == "OGG":
-            # The pages holding the tags are copied verbatim, so the tags are kept as-is
             trim_vorbis(self.filepath, output_file_path, loop_end + keep_after)
             return
+        if info.format == "WAV":
+            trim_wav(self.filepath, output_file_path, loop_end + keep_after)
+            return
 
+        # FLAC audio frames cannot be cut, so the kept samples are re-encoded (losslessly).
         # Read the samples in their native representation so that writing them back is bit-exact
         dtype = {"FLOAT": "float32", "DOUBLE": "float64"}.get(info.subtype, "int32")
         n_frames = min(info.frames, loop_end + keep_after)
@@ -376,10 +384,16 @@ class MusicLooper:
             endian=info.endian,
         )
 
-        self._copy_tags(output_file_path)
+        try:
+            copy_flac_metadata(self.filepath, output_file_path)
+        except ValueError as e:
+            logging.warning(
+                f"Could not copy the FLAC metadata blocks of \"{self.filename}\" ({e}); copying its tags only."
+            )
+            self._copy_tags(output_file_path)
 
     def _copy_tags(self, dest_filepath: str):
-        """Attempts to copy the metadata tags of the source audio file to `dest_filepath`."""
+        """Attempts to copy the metadata tags of the source audio file to `dest_filepath`, logging a warning on failure."""
         try:
             import taglib
             original_tags = None
@@ -389,10 +403,11 @@ class MusicLooper:
             with taglib.File(dest_filepath, save_on_exit=True) as dest_file:
                 for tag in original_tags:
                     dest_file.tags[tag] = original_tags[tag]
-        except Exception:
-            # silently ignore errors for now;
-            # TODO: implement logging for debugging
-            pass
+        except Exception as e:
+            # Tag copying is best-effort: the exported audio is still valid without them
+            logging.warning(
+                f"Could not copy the metadata tags of \"{self.filename}\" to \"{os.path.basename(dest_filepath)}\": {e}"
+            )
 
     def export_txt(
         self,
