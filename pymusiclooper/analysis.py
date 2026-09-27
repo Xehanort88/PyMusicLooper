@@ -238,8 +238,11 @@ def _analyze_audio(
     # so each one is released as soon as the next, smaller, representation is computed from it
     S_power = np.abs(librosa.core.stft(y=mlaudio.audio))
     S_power **= 2
-    # (chroma_stft is not given the sample rate, so it uses librosa's default of 22050 Hz; kept as-is for the tuning)
-    chroma = librosa.feature.chroma_stft(S=S_power, tuning=_estimate_tuning(S_power, sr=22050))
+    # The sample rate maps the frequency bins to pitch classes (librosa's default of 22050 Hz would shift them,
+    # e.g. by ~1.5 semitones for 48 kHz audio)
+    chroma = librosa.feature.chroma_stft(
+        S=S_power, sr=mlaudio.rate, tuning=_estimate_tuning(S_power, sr=mlaudio.rate)
+    )
     S_weighed = librosa.core.perceptual_weighting(
         S=S_power, frequencies=librosa.fft_frequencies(sr=mlaudio.rate)
     )
@@ -259,6 +262,10 @@ def _analyze_audio(
     try:
         onset_env = librosa.onset.onset_strength(S=mel_spectrogram)
 
+        # Not given the sample rate, so the tempo is estimated as if the audio were at 22050 Hz: the beat positions
+        # are unaffected, but the bpm is scaled by 22050 / rate. The bpm only sets the length of audio compared when
+        # scoring the loops (see _assess_and_filter_loop_pairs), which was tuned with this scaling; passing the real
+        # sample rate gave no better loops on real tracks, so it is kept as-is.
         pulse = librosa.beat.plp(onset_envelope=onset_env)
         beats_plp = np.flatnonzero(librosa.util.localmax(pulse))
         bpm, beats = librosa.beat.beat_track(onset_envelope=onset_env)

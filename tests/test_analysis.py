@@ -1,6 +1,7 @@
 import librosa
 import numpy as np
 import pytest
+import soundfile as sf
 from conftest import INTRO_SAMPLES, PATTERN_SAMPLES, SAMPLE_TOLERANCE, SR, assert_whole_patterns
 from numba import njit
 
@@ -198,8 +199,20 @@ def test_chroma_and_loudness_match_full_spectrogram_computation(monkeypatch, loo
 
     S_power = np.abs(librosa.stft(y=looper.mlaudio.audio)) ** 2
     S_weighed = librosa.perceptual_weighting(S=S_power, frequencies=librosa.fft_frequencies(sr=looper.mlaudio.rate))
-    np.testing.assert_array_equal(chroma, librosa.feature.chroma_stft(S=S_power))
+    np.testing.assert_array_equal(chroma, librosa.feature.chroma_stft(S=S_power, sr=looper.mlaudio.rate))
     np.testing.assert_array_equal(frame_loudness, librosa.power_to_db(S_weighed, ref=np.median).max(axis=0))
+
+
+@pytest.mark.parametrize("rate", [22050, 44100, 48000])
+def test_chroma_uses_the_audio_sample_rate(tmp_path, rate):
+    # An A4 tone must be analyzed as the pitch class A whatever the sample rate
+    # (librosa's default of 22050 Hz would shift it to G# for 48 kHz audio)
+    path = tmp_path / f"a4_{rate}.wav"
+    sf.write(path, 0.5 * np.sin(2 * np.pi * 440.0 * np.arange(3 * rate) / rate), rate)
+
+    chroma, _, _, _ = analysis._analyze_audio(MusicLooper(str(path)).mlaudio, skip_beat_analysis=True)
+
+    assert np.argmax(chroma.mean(axis=1)) == 9  # pitch classes start at C
 
 
 # --- Sample-level alignment ---
