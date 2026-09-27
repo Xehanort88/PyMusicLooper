@@ -27,3 +27,7 @@
 ## pymusiclooper extend
 
 ![`pymusiclooper extend --help`](img/pymusiclooper-extend.svg)
+
+## pymusiclooper trim
+
+![`pymusiclooper trim --help`](img/pymusiclooper-trim.svg)
