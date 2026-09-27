@@ -81,7 +81,7 @@ def find_best_loop_points(
     if approx_loop_start is not None and approx_loop_end is not None:
         # Skipping the unnecessary beat analysis (in this case) speeds up the analysis runtime by ~2x
         # and significantly reduces the total memory consumption
-        chroma, power_db, _, _ = _analyze_audio(mlaudio, skip_beat_analysis=True)
+        chroma, frame_loudness, _, _ = _analyze_audio(mlaudio, skip_beat_analysis=True)
         # Set bpm to a general average of 120
         bpm = 120.0
 
@@ -127,14 +127,14 @@ def find_best_loop_points(
         )
     elif brute_force:
         # Similarly skip beat analysis, as the results will not be used
-        chroma, power_db, _, _ = _analyze_audio(mlaudio, skip_beat_analysis=True)
+        chroma, frame_loudness, _, _ = _analyze_audio(mlaudio, skip_beat_analysis=True)
         bpm = 120.0
         beats = np.arange(start=0, stop=chroma.shape[-1], step=1, dtype=int)
         logging.info(f"Overriding number of frames to check with: {beats.size}")
         logging.info(f"Estimated iterations required using brute force: {int(beats.size*beats.size*(1-(min_loop_duration/chroma.shape[-1])))}")
         logging.info("**NOTICE** The program may appear frozen, but processing will continue in the background. This operation may take several minutes to complete.")
     else: # normal mode of operation
-        chroma, power_db, bpm, beats = _analyze_audio(mlaudio)
+        chroma, frame_loudness, bpm, beats = _analyze_audio(mlaudio)
         logging.info(f"Detected {beats.size} beats at {bpm:.0f} bpm")
 
     logging.info(
@@ -147,8 +147,13 @@ def find_best_loop_points(
 
     # Since numba jitclass cannot be cached, the pair data must be stored temporarily in a list of tuple
     # (instead of a list of LoopPairs directly) and then loaded into a list of LoopPair objects using list comprehension
+    # The features of the beat frames only, laid out contiguously for fast comparisons
     unproc_candidate_pairs = _find_candidate_pairs(
-        chroma, power_db, beats, min_loop_duration, max_loop_duration
+        np.ascontiguousarray(chroma[:, beats].T),
+        frame_loudness[beats],
+        beats,
+        min_loop_duration,
+        max_loop_duration,
     )
     candidate_pairs = [
         LoopPair(
@@ -226,21 +231,30 @@ def _analyze_audio(
         skip_beat_analysis (bool, optional): Skips beat analysis if true and returns None for bpm and beats. Defaults to False.
 
     Returns:
-        Tuple[np.ndarray, np.ndarray, float, np.ndarray]: a tuple containing the (chroma spectrogram, power spectrogram in dB, tempo/bpm, frame indices of detected beats)
+        Tuple[np.ndarray, np.ndarray, float, np.ndarray]: a tuple containing the (chroma spectrogram,
+        loudness of each frame (the maximum of the perceptually weighted power spectrogram in dB), tempo/bpm, frame indices of detected beats)
     """
-    S = librosa.core.stft(y=mlaudio.audio)
-    S_power = np.abs(S) ** 2
+    # The full-resolution spectrograms are large (several GB for long tracks),
+    # so each one is released as soon as the next, smaller, representation is computed from it
+    S_power = np.abs(librosa.core.stft(y=mlaudio.audio))
+    S_power **= 2
+    # (chroma_stft is not given the sample rate, so it uses librosa's default of 22050 Hz; kept as-is for the tuning)
+    chroma = librosa.feature.chroma_stft(S=S_power, tuning=_estimate_tuning(S_power, sr=22050))
     S_weighed = librosa.core.perceptual_weighting(
         S=S_power, frequencies=librosa.fft_frequencies(sr=mlaudio.rate)
     )
+    del S_power
     mel_spectrogram = librosa.feature.melspectrogram(
         S=S_weighed, sr=mlaudio.rate, n_mels=128, fmax=8000
     )
-    chroma = librosa.feature.chroma_stft(S=S_power)
-    power_db = librosa.power_to_db(S_weighed, ref=np.median)
+    # Only the loudest bin of each frame is compared, and converting to dB preserves the order of the values,
+    # so the frame maxima are converted instead of the whole spectrogram (with the same reference: its median)
+    median_power = np.median(S_weighed)
+    frame_loudness = librosa.power_to_db(S_weighed.max(axis=0), ref=lambda _: median_power)
+    del S_weighed
 
     if skip_beat_analysis:
-        return chroma, power_db, None, None
+        return chroma, frame_loudness, None, None
 
     try:
         onset_env = librosa.onset.onset_strength(S=mel_spectrogram)
@@ -257,33 +271,61 @@ def _analyze_audio(
     except Exception as e:
         raise LoopNotFoundError(f"Beat analysis failed for \"{mlaudio.filename}\". Cannot continue.") from e
 
-    return chroma, power_db, bpm, beats
+    return chroma, frame_loudness, bpm, beats
 
 
-@njit
-def _db_diff(power_db_f1: np.ndarray, power_db_f2: np.ndarray) -> float:
-    return np.abs(np.max(power_db_f1) - np.max(power_db_f2))
+# Number of frames tracked at a time when estimating the tuning, which bounds the memory it uses
+_TUNING_CHUNK_FRAMES = 4096
 
 
-@njit
-def _norm(a: np.ndarray) -> float:
-    return np.sqrt(np.sum(np.abs(a) ** 2, axis=0))
+def _estimate_tuning(S_power: np.ndarray, sr: float, bins_per_octave: int = 12) -> float:
+    """Gives the same result as `librosa.estimate_tuning(S=S_power, sr=sr, bins_per_octave=bins_per_octave)`
+    (which chroma_stft uses when no tuning is given), while using a fraction of the memory.
+
+    librosa's pitch tracking allocates several arrays the size of the whole spectrogram (several GB for long tracks).
+    It works on each frame independently, and the tuning estimate does not depend on the order of the detected pitches,
+    so tracking chunks of frames and pooling the detected pitches gives the same estimate.
+
+    Args:
+        S_power (np.ndarray): Power spectrogram, in the shape `(1 + n_fft/2, n_frames)`
+        sr (float): Sample rate used to convert the frequency bins to Hz
+        bins_per_octave (int, optional): Number of frequency bins per octave. Defaults to 12.
+
+    Returns:
+        float: The estimated tuning deviation, in fractions of a bin
+    """
+    pitches, magnitudes = [], []
+    for start in range(0, S_power.shape[-1], _TUNING_CHUNK_FRAMES):
+        pitch, magnitude = librosa.piptrack(S=S_power[:, start:start + _TUNING_CHUNK_FRAMES], sr=sr)
+        # Only frequencies > 0 are detected pitches
+        detected = pitch > 0
+        pitches.append(pitch[detected])
+        magnitudes.append(magnitude[detected])
+    pitches = np.concatenate(pitches)
+    magnitudes = np.concatenate(magnitudes)
+
+    # Only the pitches with at least the median magnitude count
+    threshold = np.median(magnitudes) if pitches.size else 0.0
+    return librosa.pitch_tuning(pitches[magnitudes >= threshold], bins_per_octave=bins_per_octave)
 
 
 @njit(cache=True)
 def _find_candidate_pairs(
-    chroma: np.ndarray,
-    power_db: np.ndarray,
+    beat_chroma: np.ndarray,
+    beat_loudness: np.ndarray,
     beats: np.ndarray,
     min_loop_duration: int,
     max_loop_duration: int,
 ) -> List[Tuple[int, int, float, float]]:
     """Generates a list of all valid candidate loop pairs using combinations of beat indices,
-    by comparing the notes using the chroma spectrogram and their loudness difference
+    by comparing the notes using the chroma spectrogram and their loudness difference.
+
+    Every pair of beats is compared, so the distances are computed with scalar loops over the 12 pitch classes
+    (instead of array operations, which allocate a temporary array for each of the millions of comparisons).
 
     Args:
-        chroma (np.ndarray): The chroma spectrogram
-        power_db (np.ndarray): The power spectrogram in dB
+        beat_chroma (np.ndarray): The chroma of each beat frame (float32), in the shape `(n_beats, 12)`, C-contiguous
+        beat_loudness (np.ndarray): The loudness of each beat frame in dB (float32), in the shape `(n_beats,)`
         beats (np.ndarray): The frame indices of detected beats
         min_loop_duration (int): Minimum loop duration (in frames)
         max_loop_duration (int): Maximum loop duration (in frames)
@@ -297,27 +339,42 @@ def _find_candidate_pairs(
     ## Mainly found through trial and error,
     ## higher values typically result in the inclusion of musically unrelated beats/notes
     ACCEPTABLE_NOTE_DEVIATION = 0.0875
-    ## Since the _db_diff comparison is takes a perceptually weighted power_db frame,
+    ## Since the loudness comparison takes the loudest bin of perceptually weighted power frames in dB,
     ## the difference should be imperceptible (ideally, close to 0)
     ## Based on trial and error, values higher than ~0.5 have a perceptible
     ## difference in loudness
     ACCEPTABLE_LOUDNESS_DIFFERENCE = 0.5
 
-    deviation = _norm(chroma[..., beats] * ACCEPTABLE_NOTE_DEVIATION)
+    n_beats, n_pitch_classes = beat_chroma.shape
 
-    for idx, loop_end in enumerate(beats):
-        for loop_start in beats:
+    # The note distance accepted for each loop end: the norm of its chroma scaled by ACCEPTABLE_NOTE_DEVIATION
+    # (in float64, as in the original array-based implementation, so that the results are unchanged)
+    deviation = np.empty(n_beats)
+    for idx in range(n_beats):
+        deviation_squares = 0.0
+        for k in range(n_pitch_classes):
+            value = np.float64(beat_chroma[idx, k]) * ACCEPTABLE_NOTE_DEVIATION
+            deviation_squares += value * value
+        deviation[idx] = np.sqrt(deviation_squares)
+
+    for idx in range(n_beats):
+        loop_end = beats[idx]
+        for start_idx in range(n_beats):
+            loop_start = beats[start_idx]
             loop_length = loop_end - loop_start
             if loop_length < min_loop_duration:
                 break
             if loop_length > max_loop_duration:
                 continue
-            note_distance = _norm(chroma[..., loop_end] - chroma[..., loop_start])
+            # Euclidean distance of the chroma vectors (in float32, like the chroma)
+            distance_squares = np.float32(0.0)
+            for k in range(n_pitch_classes):
+                difference = beat_chroma[idx, k] - beat_chroma[start_idx, k]
+                distance_squares += difference * difference
+            note_distance = np.sqrt(distance_squares)
 
             if note_distance <= deviation[idx]:
-                loudness_difference = _db_diff(
-                    power_db[..., loop_end], power_db[..., loop_start]
-                )
+                loudness_difference = abs(beat_loudness[idx] - beat_loudness[start_idx])
                 loop_pair = (
                     int(loop_start),
                     int(loop_end),
