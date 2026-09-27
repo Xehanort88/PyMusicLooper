@@ -1,6 +1,9 @@
+import librosa
 import numpy as np
 import pytest
+import soundfile as sf
 from conftest import INTRO_SAMPLES, PATTERN_SAMPLES, SAMPLE_TOLERANCE, SR, assert_whole_patterns
+from numba import njit
 
 from pymusiclooper import analysis
 from pymusiclooper.analysis import (
@@ -141,6 +144,75 @@ def test_truncated_lookbehind_weights_frames_nearest_the_loop_point():
     score = _calculate_subseq_beat_similarity(3, 100, chroma, -20, weights=weights)
 
     assert score == pytest.approx(weights[-3:].sum() / weights.sum())
+
+
+# --- Memory/speed optimized features: must give the same results as the straightforward computations ---
+
+
+@njit
+def _reference_norm(a):
+    return np.sqrt(np.sum(np.abs(a) ** 2, axis=0))
+
+
+@njit
+def _reference_candidate_pairs(chroma, power_db, beats, min_loop_duration, max_loop_duration):
+    """The original array-based candidate search, on the full chroma and dB spectrograms."""
+    candidate_pairs = []
+    deviation = _reference_norm(chroma[..., beats] * 0.0875)
+    for idx, loop_end in enumerate(beats):
+        for loop_start in beats:
+            loop_length = loop_end - loop_start
+            if loop_length < min_loop_duration:
+                break
+            if loop_length > max_loop_duration:
+                continue
+            note_distance = _reference_norm(chroma[..., loop_end] - chroma[..., loop_start])
+            if note_distance <= deviation[idx]:
+                loudness_difference = np.abs(np.max(power_db[..., loop_end]) - np.max(power_db[..., loop_start]))
+                if loudness_difference <= 0.5:
+                    candidate_pairs.append((int(loop_start), int(loop_end), note_distance, loudness_difference))
+    return candidate_pairs
+
+
+def test_candidate_pairs_match_array_based_search():
+    rng = np.random.default_rng(3)
+    n_frames = 3000
+    # A repeating pattern with a little noise, so that many (but not all) beat pairs are candidates
+    chroma = (np.tile(rng.random((12, 100)), 30) + 0.05 * rng.random((12, n_frames))).astype(np.float32)
+    power_db = (np.tile(rng.random((40, 100)) * 3, 30) + 0.4 * rng.random((40, n_frames))).astype(np.float32)
+    beats = np.sort(rng.choice(n_frames, size=600, replace=False))
+
+    expected = _reference_candidate_pairs(chroma, power_db, beats, 500, 2500)
+    actual = analysis._find_candidate_pairs(
+        np.ascontiguousarray(chroma[:, beats].T), power_db.max(axis=0)[beats], beats, 500, 2500
+    )
+
+    assert len(expected) > 100
+    assert actual == expected
+
+
+def test_chroma_and_loudness_match_full_spectrogram_computation(monkeypatch, looper):
+    # Several chunks, including a partial one, even for the short test track
+    monkeypatch.setattr(analysis, "_TUNING_CHUNK_FRAMES", 37)
+
+    chroma, frame_loudness, _, _ = analysis._analyze_audio(looper.mlaudio, skip_beat_analysis=True)
+
+    S_power = np.abs(librosa.stft(y=looper.mlaudio.audio)) ** 2
+    S_weighed = librosa.perceptual_weighting(S=S_power, frequencies=librosa.fft_frequencies(sr=looper.mlaudio.rate))
+    np.testing.assert_array_equal(chroma, librosa.feature.chroma_stft(S=S_power, sr=looper.mlaudio.rate))
+    np.testing.assert_array_equal(frame_loudness, librosa.power_to_db(S_weighed, ref=np.median).max(axis=0))
+
+
+@pytest.mark.parametrize("rate", [22050, 44100, 48000])
+def test_chroma_uses_the_audio_sample_rate(tmp_path, rate):
+    # An A4 tone must be analyzed as the pitch class A whatever the sample rate
+    # (librosa's default of 22050 Hz would shift it to G# for 48 kHz audio)
+    path = tmp_path / f"a4_{rate}.wav"
+    sf.write(path, 0.5 * np.sin(2 * np.pi * 440.0 * np.arange(3 * rate) / rate), rate)
+
+    chroma, _, _, _ = analysis._analyze_audio(MusicLooper(str(path)).mlaudio, skip_beat_analysis=True)
+
+    assert np.argmax(chroma.mean(axis=1)) == 9  # pitch classes start at C
 
 
 # --- Sample-level alignment ---

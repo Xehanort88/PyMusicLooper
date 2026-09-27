@@ -5,6 +5,37 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [Unreleased]
+
+### Added
+
+- `trim` command: losslessly cut the audio a given number of samples (`--keep-after`, 100 by default) after the loop end, keeping the original format, bit depth and metadata (WAV, FLAC and Ogg Vorbis only). WAV and Ogg Vorbis files are cut without re-encoding
+- Interactive mode offers to trim WAV, FLAC and Ogg Vorbis files after the loop end once the loop is chosen (except when printing loop points to the terminal); with `tag`, a single tagged and trimmed copy is written
+- Loop points already stored in a file's metadata tags (e.g. LOOP_START/LOOP_END, LOOPSTART/LOOPLENGTH), or in a WAV file's sampler (`smpl`) chunk, are used as the first loop choice by all commands; `--ignore-tags` skips them
+- `--tags-only` option: use only the loop points stored in the files' metadata tags, skipping the (slower) loop analysis; files without valid loop tags are skipped
+- Batch processing ends with a summary of the processed files (with loop points from their tags or detected ones), and of the skipped and failed files grouped by reason
+- `tag` also writes the loop points of WAV files to their sampler (`smpl`) chunk, which many game engines and samplers read
+- Test suite, run on Ubuntu and Windows with Python 3.10 and 3.13
+
+### Changed
+
+- Loop points are aligned at the sample level: the loop end is moved to where the waveforms at the two loop points line up, then both points are shifted to where they differ the least, avoiding the faint flam or phase smear of loops off by a few hundred samples (falls back to the nearest zero crossings when the waveforms do not match well enough)
+- The chroma (pitch classes) used to compare the notes is computed with the audio's sample rate instead of librosa's default of 22050 Hz, which shifted the pitch classes of 48 kHz audio by ~1.5 semitones. This changes the best detected loop of some tracks, with no measurable effect on the loop quality overall
+- The candidate loop search is ~60x faster (much faster brute force), and the analysis uses about half the memory, with unchanged results
+- Skipped and non-audio files are no longer logged as errors during batch processing (they are listed in the summary; `--verbose` still logs them)
+
+### Fixed
+
+- Mono tracks were played and exported louder than the original
+- Longer loops were never preferred among near-identical scores
+- Loops starting in the first seconds of a track were underscored
+- Interactive mode discarded the choice made after `more`, `all` or `reset` and prompted again
+- `extend` with a fade length of 0 crashed
+- `export_tags()` without an output directory used the file path as the directory
+- The txt export message named `loop.txt` instead of `loops.txt`
+- Ctrl+C at the interactive prompt now exits cleanly on Windows
+
+
 ## [3.6.0] - 2025-11-01
 
 ### Changed

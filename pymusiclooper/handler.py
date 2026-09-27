@@ -2,8 +2,9 @@ import logging
 import os
 import signal
 import sys
+from collections import Counter
 from contextlib import contextmanager
-from typing import List, Literal, Optional, Tuple
+from typing import List, Literal, NamedTuple, Optional, Tuple
 
 from rich.progress import MofNCompleteColumn, Progress, SpinnerColumn, TimeElapsedColumn
 from rich.table import Table
@@ -11,7 +12,7 @@ from rich.table import Table
 from pymusiclooper.analysis import LoopPair
 from pymusiclooper.console import rich_console
 from pymusiclooper.core import MusicLooper
-from pymusiclooper.exceptions import AudioLoadError, LoopNotFoundError
+from pymusiclooper.exceptions import AudioLoadError, LoopNotFoundError, NotAudioError
 from pymusiclooper.utils import DEFAULT_OUTPUT_DIRECTORY_NAME
 
 # Default number of samples to keep after the loop end when trimming (interactively or with the trim command): enough for players
@@ -31,6 +32,7 @@ class LoopHandler:
         brute_force: bool = False,
         disable_pruning: bool = False,
         ignore_tags: bool = False,
+        tags_only: bool = False,
         _progressbar: Progress = None,
         **kwargs,
     ):
@@ -55,6 +57,7 @@ class LoopHandler:
             brute_force=brute_force,
             disable_pruning=disable_pruning,
             use_embedded_tags=not ignore_tags,
+            tags_only=tags_only,
         )
         self.interactive_mode = "PML_INTERACTIVE_MODE" in os.environ
         self.in_samples = "PML_DISPLAY_SAMPLES" in os.environ
@@ -198,6 +201,7 @@ class LoopExportHandler(LoopHandler):
         brute_force: bool = False,
         disable_pruning: bool = False,
         ignore_tags: bool = False,
+        tags_only: bool = False,
         split_audio: bool = False,
         format: Literal["WAV", "FLAC", "OGG", "MP3"] = "WAV",
         to_txt: bool = False,
@@ -223,6 +227,7 @@ class LoopExportHandler(LoopHandler):
             brute_force=brute_force,
             disable_pruning=disable_pruning,
             ignore_tags=ignore_tags,
+            tags_only=tags_only,
             **kwargs,
         )
         self.output_directory = output_dir
@@ -241,10 +246,14 @@ class LoopExportHandler(LoopHandler):
         self.trim = trim
         self.keep_after = keep_after
         self._is_autocreated_outdir = False
+        self.chosen_loop_pair: Optional[LoopPair] = None
+        # Errors of the exports that are logged instead of raised, reported in the batch summary
+        self.errors: List[str] = []
 
     def run(self):
         self.loop_pair_list = self.get_all_loop_pairs()
         chosen_loop_pair = self.choose_loop_pair(self.interactive_mode)
+        self.chosen_loop_pair = chosen_loop_pair
         loop_start = chosen_loop_pair.loop_start
         loop_end = chosen_loop_pair.loop_end
 
@@ -313,7 +322,7 @@ class LoopExportHandler(LoopHandler):
                 rich_console.print(message)
         # Usually: unknown file format specified; raised by soundfile
         except ValueError as e:
-            logging.error(e)
+            self._report_error(e)
 
     def extend_track_runner(self, loop_start: int, loop_end: int):
         # Add a progress bar since it could take some time to export
@@ -346,7 +355,7 @@ class LoopExportHandler(LoopHandler):
                 rich_console.print(message)
         # Usually: unknown file format specified; raised by soundfile
         except ValueError as e:
-            logging.error(e)
+            self._report_error(e)
 
     def trim_prompt(self) -> Tuple[bool, int]:
         """Asks whether to also losslessly trim the audio after the chosen loop end, and how many samples to keep after it."""
@@ -384,7 +393,7 @@ class LoopExportHandler(LoopHandler):
                 rich_console.print(message)
         # Unsupported (lossy) source format
         except ValueError as e:
-            logging.error(e)
+            self._report_error(e)
 
     def txt_export_runner(self, loop_start: int, loop_end: int):
         if self.alt_export_top != 0:
@@ -456,6 +465,10 @@ class LoopExportHandler(LoopHandler):
         else:
             rich_console.print(message)
 
+    def _report_error(self, e: Exception):
+        logging.error(e)
+        self.errors.append(str(e))
+
     def _fmt(self, samples: int):
         if self.fmt == "seconds":
             return str(self.musiclooper.samples_to_seconds(samples))
@@ -463,6 +476,18 @@ class LoopExportHandler(LoopHandler):
             return str(self.musiclooper.samples_to_ftime(samples))
         else:
             return str(samples)
+
+
+class BatchFileResult(NamedTuple):
+    """Outcome of processing one file in batch mode."""
+    path: str
+    # "tags" or "detected" (processed with the loop points from the file's tags, or with detected/chosen ones),
+    # "skipped" (no loop points found, or the audio could not be analyzed), "not_audio" or "failed" (an export failed)
+    outcome: Literal["tags", "detected", "skipped", "not_audio", "failed"]
+    messages: Tuple[str, ...] = ()
+    # Short reason shared by the files skipped the same way, to group them in the summary, and the file's details
+    reason: Optional[str] = None
+    detail: Optional[str] = None
 
 
 class BatchHandler:
@@ -505,6 +530,7 @@ class BatchHandler:
             else self.clone_file_tree_structure(files, self.output_directory)
         )
 
+        results = []
         with Progress(
             SpinnerColumn(),
             *Progress.get_default_columns(),
@@ -527,9 +553,59 @@ class BatchHandler:
                     "output_dir": self.output_directory if self.flatten else output_dirs[file_idx]
                 }
                 try:
-                    self._batch_export_helper(**task_kwargs)
+                    results.append(self._batch_export_helper(**task_kwargs))
                 finally:
                     self._cleanup_empty_created_dirs()
+
+        self.print_summary(results)
+        return results
+
+    def print_summary(self, results: List[BatchFileResult]):
+        """Prints how many files were processed (and with which loop points), skipped or failed, with the reasons."""
+        def with_outcome(outcome):
+            return [result for result in results if result.outcome == outcome]
+
+        def relpath(result):
+            return os.path.relpath(result.path, self.directory_path)
+
+        def print_plain(text):
+            # File names and error messages may contain brackets, which rich would otherwise parse as markup
+            rich_console.print(text, markup=False, highlight=False)
+
+        n_tags, n_detected = len(with_outcome("tags")), len(with_outcome("detected"))
+        rich_console.print(f"\n[bold]Batch summary[/] ({len(results)} file{'' if len(results) == 1 else 's'}):")
+        rich_console.print(
+            f"  [green]Processed: {n_tags + n_detected}[/]"
+            f" ({n_tags} with the loop points from their tags, {n_detected} with detected loop points)"
+        )
+
+        for outcome, label in (("skipped", "[yellow]Skipped"), ("failed", "[red]Failed")):
+            listed = with_outcome(outcome)
+            if not listed:
+                continue
+            rich_console.print(f"  {label}: {len(listed)}[/]")
+
+            groups = {}
+            for result in listed:
+                if result.reason is not None:
+                    groups.setdefault(result.reason, []).append(result)
+            for reason, group in groups.items():
+                print_plain(f"    {reason[0].upper()}{reason[1:]} ({len(group)}):")
+                for result in group:
+                    print_plain(f"      {relpath(result)}" + (f": {result.detail}" if result.detail else ""))
+
+            for result in listed:
+                if result.reason is None:
+                    for message in result.messages:
+                        print_plain(f"    - {relpath(result)}: {message}")
+
+        not_audio = with_outcome("not_audio")
+        if not_audio:
+            extensions = Counter(os.path.splitext(result.path)[1].lower() or "(no extension)" for result in not_audio)
+            print_plain(
+                f"  Not audio files: {len(not_audio)}"
+                f" ({', '.join(f'{extension}: {count}' for extension, count in extensions.most_common())})"
+            )
 
     def clone_file_tree_structure(self, in_files: List[str], output_directory: str) -> List[str]:
         common_path = os.path.commonpath(in_files)
@@ -563,14 +639,27 @@ class BatchHandler:
         )
 
     @staticmethod
-    def _batch_export_helper(**kwargs):
+    def _batch_export_helper(**kwargs) -> BatchFileResult:
+        path = kwargs["path"]
         try:
             export_handler = LoopExportHandler(**kwargs, batch_mode=True)
             export_handler.run()
+        # Skipped files are listed in the summary, so they are only logged in verbose mode
+        except NotAudioError as e:
+            logging.info(e)
+            return BatchFileResult(path, "not_audio", (str(e),))
         except (AudioLoadError, LoopNotFoundError) as e:
-            logging.error(e)
+            logging.warning(e)
+            return BatchFileResult(
+                path, "skipped", (str(e),), reason=getattr(e, "reason", None), detail=getattr(e, "detail", None)
+            )
         except Exception as e:
             logging.error(e)
+            return BatchFileResult(path, "failed", (str(e),))
+
+        if export_handler.errors:
+            return BatchFileResult(path, "failed", tuple(export_handler.errors))
+        return BatchFileResult(path, "tags" if export_handler.chosen_loop_pair.from_metadata else "detected")
 
     def _cleanup_empty_created_dirs(self):
         dirs_to_check = self._created_dirs

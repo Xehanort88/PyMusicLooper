@@ -93,6 +93,35 @@ def test_batch_export_skips_non_audio_files(run, track_path, stereo_track_path, 
     assert sorted(line.split()[-1] for line in lines) == ["stereo.wav", "track.wav"]
 
 
+def test_tags_only_conflicts_with_ignore_tags(run, track_path):
+    result = run("export-points", "--path", track_path, "--tags-only", "--ignore-tags")
+
+    assert result.exit_code == 2
+    assert "cannot be used together" in result.output
+
+
+def test_batch_trim_tags_only_prints_summary(run, track_path, stereo_track_path, tmp_path):
+    import soundfile as sf
+    import taglib
+
+    in_dir = tmp_path / "in"
+    out_dir = tmp_path / "out"
+    in_dir.mkdir()
+    shutil.copy(track_path, in_dir)
+    shutil.copy(stereo_track_path, in_dir)
+    with taglib.File(str(in_dir / "track.wav"), save_on_exit=True) as audio_file:
+        audio_file.tags["LOOP_START"] = ["1000"]
+        audio_file.tags["LOOP_END"] = ["50000"]
+
+    result = run("trim", "--path", in_dir, "--tags-only", "--keep-after", 0, "--output-dir", out_dir)
+
+    assert result.exit_code == 0
+    assert [p.name for p in out_dir.iterdir()] == ["track-trimmed.wav"]
+    assert sf.info(out_dir / "track-trimmed.wav").frames == 50000
+    assert "Batch summary" in result.output
+    assert "Skipped: 1" in result.output
+
+
 def test_trim_keeps_recommended_samples_after_loop_end_by_default(run, track_path, tmp_path):
     import soundfile as sf
 
